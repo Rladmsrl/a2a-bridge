@@ -1,0 +1,42 @@
+services:
+  a2a-bridge:
+    build: .
+    image: a2a-bridge:1.0.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      A2A_AGENTS_CONFIG: /app/config/agents.json
+      A2A_DB_PATH: /app/data/bridge.db
+      A2A_HOST: 0.0.0.0
+      A2A_PORT: "8080"
+    volumes:
+      - ./config/agents.json:/app/config/agents.json:ro
+      - a2a-data:/app/data
+    # only reachable from the host; Caddy/nginx terminates HTTPS in front
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  # Optional: Caddy with automatic Let's Encrypt. Enable with: docker compose --profile caddy up -d
+  caddy:
+    image: caddy:2
+    profiles: ["caddy"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      A2A_DOMAIN: ${A2A_DOMAIN:-a2a.example.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  a2a-data:
+  caddy-data:
+  caddy-config:

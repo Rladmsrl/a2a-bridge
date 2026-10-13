@@ -1,0 +1,23 @@
+# Domain comes from env A2A_DOMAIN (set by scripts/install.sh in .env). DNS A record -> server IP.
+# Caddy obtains TLS certificates automatically (TLS-ALPN on 443, or HTTP-01 if 80 is open).
+{$A2A_DOMAIN:a2a.example.com} {
+	encode zstd gzip
+	request_body {
+		max_size 10MB
+	}
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+		}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+}

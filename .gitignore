@@ -1,0 +1,10 @@
+.venv/
+.env
+data/
+*.db
+*.db-*
+__pycache__/
+.pytest_cache/
+config/agents.json
+api-key.txt
+state/

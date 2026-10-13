@@ -1,0 +1,34 @@
+# /etc/systemd/system/a2a-bridge.service
+# Install: see README (useradd a2a; code in /opt/a2a-bridge; venv in /opt/a2a-bridge/.venv; env in /etc/a2a-bridge/env)
+[Unit]
+Description=A2A Bridge (A2A <-> Grok Bot webhook)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=a2a
+Group=a2a
+WorkingDirectory=/opt/a2a-bridge
+EnvironmentFile=/etc/a2a-bridge/env
+Environment=A2A_ENV_FILE=/nonexistent
+ExecStart=/opt/a2a-bridge/.venv/bin/python -m a2a_bridge
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/a2a-bridge
+
+[Install]
+WantedBy=multi-user.target

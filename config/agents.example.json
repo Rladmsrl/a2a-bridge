@@ -1,0 +1,125 @@
+{
+  "agents": [
+    {
+      "name": "gateway",
+      "display_name": "My A2A Gateway",
+      "description": "A general-purpose A2A entrypoint. Send any task as plain text (optionally with files or structured data). The agent works asynchronously, may ask follow-up questions (input-required), and returns results as artifacts.",
+      "version": "1.0.0",
+      "webhook_url_env": "BOT_GATEWAY_WEBHOOK_URL",
+      "webhook_token_env": "BOT_GATEWAY_WEBHOOK_TOKEN",
+      "shared_secret_env": "BOT_GATEWAY_SHARED_SECRET",
+      "webhook_auth_header": "Authorization",
+      "webhook_auth_scheme": "Bearer",
+      "input_modes": [
+        "text/plain",
+        "application/json",
+        "*/*"
+      ],
+      "output_modes": [
+        "text/plain",
+        "text/markdown",
+        "application/json"
+      ],
+      "required_inputs": [],
+      "skills": [
+        {
+          "id": "general-task",
+          "name": "General task",
+          "description": "Accepts any task described in natural language text: research, writing, coding, analysis, operations. Include goal, context and how success is judged when relevant; the agent will ask if something is missing.",
+          "tags": [
+            "general",
+            "assistant",
+            "async"
+          ],
+          "examples": [
+            "Summarize the attached document and list open questions.",
+            "repo_url: https://github.com/org/repo\ngoal: fix failing CI\nacceptance_criteria: CI green"
+          ]
+        }
+      ],
+      "provider": {
+        "organization": "Example",
+        "url": "https://example.com"
+      }
+    },
+    {
+      "name": "coder",
+      "display_name": "Example Coding Agent",
+      "description": "Implements code changes in a Git repository and reports results.",
+      "version": "1.0.0",
+      "webhook_url_env": "BOT_CODER_WEBHOOK_URL",
+      "webhook_token_env": "BOT_CODER_WEBHOOK_TOKEN",
+      "shared_secret_env": "BOT_CODER_SHARED_SECRET",
+      "input_modes": [
+        "text/plain",
+        "application/json",
+        "*/*"
+      ],
+      "output_modes": [
+        "text/plain",
+        "text/markdown",
+        "application/json"
+      ],
+      "provider": {
+        "organization": "Example Org",
+        "url": "https://example.com"
+      },
+      "required_inputs": [
+        {
+          "name": "repo_url",
+          "required": true,
+          "description": "Git repository URL (https)",
+          "example": "https://github.com/org/repo"
+        },
+        {
+          "name": "goal",
+          "required": true,
+          "description": "What should be achieved"
+        },
+        {
+          "name": "acceptance_criteria",
+          "required": true,
+          "description": "How success is verified (tests, behaviour)"
+        },
+        {
+          "name": "branch",
+          "required": false,
+          "description": "Base branch, default main"
+        }
+      ],
+      "skills": [
+        {
+          "id": "code-change",
+          "name": "Code change",
+          "description": "Clone a repo, implement the goal, verify acceptance criteria and report a PR/diff.",
+          "tags": [
+            "code",
+            "git",
+            "pull-request"
+          ],
+          "examples": [
+            "repo_url: https://github.com/org/repo\ngoal: add /healthz endpoint\nacceptance_criteria: GET /healthz returns 200"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "assistant",
+      "display_name": "Example Assistant",
+      "description": "General research and writing tasks.",
+      "webhook_url_env": "BOT_ASSISTANT_WEBHOOK_URL",
+      "webhook_token_env": "BOT_ASSISTANT_WEBHOOK_TOKEN",
+      "shared_secret_env": "BOT_ASSISTANT_SHARED_SECRET",
+      "skills": [
+        {
+          "id": "research",
+          "name": "Research",
+          "description": "Answer questions with sources.",
+          "tags": [
+            "research"
+          ]
+        }
+      ]
+    }
+  ]
+}
