@@ -21,7 +21,7 @@ from .config import ApiKey, Settings, load_settings
 from .db import Store
 from .events import EventBus
 from .logging_setup import setup_logging
-from .roster import ROSTER_BUS_KEY, VALID_STATUSES
+from .roster import ANON_STREAM_LABEL, ROSTER_BUS_KEY, VALID_AVAILABILITY, VALID_STATUSES, view_fp
 from .security import RateLimiter, bearer, callback_token, match_api_key, verify_signature, SIG_HEADER
 from .service import Bridge, Conflict
 
@@ -140,8 +140,10 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         rid = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
         t0 = time.perf_counter()
         ip = client_ip(req)
-        if req.url.path not in ("/healthz",):
-            ok, retry = limiter.allow(f"ip:{ip}")
+        path = req.url.path
+        if path not in ("/healthz",):
+            bucket = f"ip-roster:{ip}" if path == "/roster" or path.startswith("/roster/") else f"ip:{ip}"
+            ok, retry = limiter.allow(bucket)
             if not ok:
                 return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
                                     headers={"Retry-After": str(int(retry) + 1)})
@@ -231,40 +233,68 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
                              "outbox": b.store.outbox_stats(), "streams": b.bus.count()},
                             status_code=200 if ok else 503)
 
+    def roster_unauth():
+        return JSONResponse({"error": "unauthorized"}, status_code=401,
+                            headers={"WWW-Authenticate": 'Bearer realm="a2a-bridge"'})
+
     def roster_auth(req: Request) -> tuple[ApiKey | None, JSONResponse | None]:
-        presented = bearer(req.headers.get("authorization")) or req.headers.get("x-api-key")
-        key = match_api_key(s.api_keys, presented)
-        if key is None:
-            if presented or not s.roster_public:
+        auth = req.headers.get("authorization")
+        xkey = req.headers.get("x-api-key")
+        key = None
+        if auth is not None:
+            presented = bearer(auth)
+            if not presented:
                 log.warning("roster auth failed", extra={"ip": client_ip(req)})
-                return None, JSONResponse({"error": "unauthorized"}, status_code=401,
-                                          headers={"WWW-Authenticate": 'Bearer realm="a2a-bridge"'})
-            key = ApiKey(label="*", sha256="", agents=None, tier="anonymous")
+                return None, roster_unauth()
+            key = match_api_key(s.api_keys, presented)
+            if key is None:
+                log.warning("roster auth failed", extra={"ip": client_ip(req)})
+                return None, roster_unauth()
+        elif xkey:
+            key = match_api_key(s.api_keys, xkey)
+            if key is None:
+                log.warning("roster auth failed", extra={"ip": client_ip(req)})
+                return None, roster_unauth()
+        elif s.roster_public:
+            key = ApiKey(label=ANON_STREAM_LABEL, sha256="", agents=None, tier="anonymous")
         else:
-            ok, retry = limiter.allow(f"key:{key.label}")
-            if not ok:
-                return None, JSONResponse({"error": "rate limit exceeded"}, status_code=429,
-                                          headers={"Retry-After": str(int(retry) + 1)})
+            log.warning("roster auth failed", extra={"ip": client_ip(req)})
+            return None, roster_unauth()
+        ok, retry = limiter.allow(f"roster-key:{key.label}")
+        if not ok:
+            return None, JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                      headers={"Retry-After": str(int(retry) + 1)})
         return key, None
 
-    def parse_roster_query(req: Request) -> tuple[list[str] | None, set[str] | None, bool, JSONResponse | None]:
+    def parse_roster_query(req: Request, key: ApiKey) -> tuple[
+            list[str] | None, set[str] | None, set[str] | None, bool, JSONResponse | None]:
         agents = [x for x in req.query_params.getlist("agent") if x]
         status_raw = req.query_params.get("status")
+        avail_raw = req.query_params.get("availability")
         include = req.query_params.get("include")
         status_filter = None
+        availability_filter = None
         if status_raw:
+            if key.tier in ("basic", "anonymous"):
+                return None, None, None, False, JSONResponse({"error": "forbidden"}, status_code=403)
             parts = {p.strip() for p in status_raw.split(",") if p.strip()}
             if not parts or not parts <= set(VALID_STATUSES):
-                return None, None, False, JSONResponse(
+                return None, None, None, False, JSONResponse(
                     {"error": "invalid parameter", "param": "status"}, status_code=400)
             status_filter = parts
+        if avail_raw:
+            parts = {p.strip() for p in avail_raw.split(",") if p.strip()}
+            if not parts or not parts <= set(VALID_AVAILABILITY):
+                return None, None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "availability"}, status_code=400)
+            availability_filter = parts
         include_tasks = False
         if include:
             if include != "tasks":
-                return None, None, False, JSONResponse(
+                return None, None, None, False, JSONResponse(
                     {"error": "invalid parameter", "param": "include"}, status_code=400)
             include_tasks = True
-        return (agents or None), status_filter, include_tasks, None
+        return (agents or None), status_filter, availability_filter, include_tasks, None
 
     def roster_response(req: Request, body: dict, etag: str):
         inm = req.headers.get("if-none-match")
@@ -277,16 +307,16 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         key, err = roster_auth(req)
         if err:
             return err
-        agent_filter, status_filter, include_tasks, qerr = parse_roster_query(req)
+        assert key is not None
+        agent_filter, status_filter, availability_filter, include_tasks, qerr = parse_roster_query(req, key)
         if qerr:
             return qerr
-        assert key is not None
         if include_tasks and key.tier != "owner":
             return JSONResponse({"error": "forbidden"}, status_code=403)
         b: Bridge = req.app.state.bridge
         try:
             body, etag = b.roster.snapshot(key, agent_filter=agent_filter, status_filter=status_filter,
-                                           include_tasks=include_tasks)
+                                           availability_filter=availability_filter, include_tasks=include_tasks)
         except sqlite3.Error:
             return JSONResponse({"error": "degraded"}, status_code=503)
         return roster_response(req, body, etag)
@@ -302,29 +332,50 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         if not b.roster.acquire_stream(label):
             return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
                                 headers={"Retry-After": "30"})
-        q = b.bus.subscribe(ROSTER_BUS_KEY)
+        bus_q = b.bus.subscribe(ROSTER_BUS_KEY)
+        out: asyncio.Queue = asyncio.Queue(maxsize=1)
+        sentinel = object()
+        released = False
 
-        async def gen():
+        def _release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            b.bus.unsubscribe(ROSTER_BUS_KEY, bus_q)
+            b.roster.release_stream(label)
+
+        async def put(chunk: bytes) -> None:
+            await asyncio.wait_for(out.put(chunk), s.roster_stream_timeout_s)
+
+        async def producer():
+            sub_seq = 0
+            started = time.monotonic()
             try:
-                yield b"retry: 3000\n\n"
+                await put(b"retry: 3000\n\n")
                 try:
                     snap, _ = b.roster.snapshot(key)
                 except sqlite3.Error:
-                    yield b'event: error\ndata: {"error":"degraded"}\n\n'
+                    await put(b'event: error\ndata: {"error":"degraded"}\n\n')
                     return
-                seq = b.roster.seq
-                yield (f"event: snapshot\nid: {seq}\n"
-                       f"data: {json.dumps(snap, separators=(',', ':'))}\n\n").encode()
-                last = {a["id"]: json.dumps(a, sort_keys=True, separators=(",", ":"))
-                        for a in snap["agents"]}
+                sub_seq += 1
+                await put((f"event: snapshot\nid: {sub_seq}\n"
+                           f"data: {json.dumps(snap, separators=(',', ':'))}\n\n").encode())
+                last = {a["id"]: view_fp(a) for a in snap["agents"]}
                 visible = set(b.roster.visible_names(key))
                 while True:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= s.roster_stream_max_s:
+                        return
+                    wait = min(s.sse_heartbeat_s, max(0.05, s.roster_stream_max_s - elapsed))
                     try:
-                        ev = await asyncio.wait_for(q.get(), s.sse_heartbeat_s)
+                        ev = await asyncio.wait_for(bus_q.get(), wait)
                     except asyncio.TimeoutError:
-                        if getattr(q, "dropped", False):
+                        if getattr(bus_q, "dropped", False):
                             return
-                        yield b": keepalive\n\n"
+                        if time.monotonic() - started >= s.roster_stream_max_s:
+                            return
+                        await put(b": keepalive\n\n")
                         continue
                     agent_id = ev.get("agent")
                     if not agent_id or agent_id not in visible:
@@ -332,18 +383,45 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
                     rec = b.roster.last(agent_id)
                     if rec is None:
                         continue
-                    projected = b.roster.project(rec, key)
-                    fp = json.dumps(projected, sort_keys=True, separators=(",", ":"))
+                    projected = b.roster.project(b.roster.with_duration(rec), key)
+                    fp = view_fp(projected)
                     if last.get(agent_id) == fp:
                         continue
                     last[agent_id] = fp
-                    sid = ev.get("seq", b.roster.seq)
-                    payload = {"seq": sid, "agent": projected}
-                    yield (f"event: update\nid: {sid}\n"
-                           f"data: {json.dumps(payload, separators=(',', ':'))}\n\n").encode()
+                    sub_seq += 1
+                    payload = {"seq": sub_seq, "agent": projected}
+                    await put((f"event: update\nid: {sub_seq}\n"
+                               f"data: {json.dumps(payload, separators=(',', ':'))}\n\n").encode())
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                return
             finally:
-                b.bus.unsubscribe(ROSTER_BUS_KEY, q)
-                b.roster.release_stream(label)
+                _release()
+                try:
+                    out.put_nowait(sentinel)
+                except asyncio.QueueFull:
+                    pass
+
+        async def gen():
+            task = asyncio.create_task(producer())
+            try:
+                while True:
+                    if task.done() and out.empty():
+                        break
+                    try:
+                        item = await asyncio.wait_for(out.get(), 0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    if item is sentinel:
+                        break
+                    yield item
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                _release()
 
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
@@ -355,7 +433,7 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         if err:
             return err
         assert key is not None
-        _af, status_filter, include_tasks, qerr = parse_roster_query(req)
+        _af, status_filter, availability_filter, include_tasks, qerr = parse_roster_query(req, key)
         if qerr:
             return qerr
         if include_tasks and key.tier != "owner":
@@ -365,7 +443,7 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
             return JSONResponse({"error": "agent not found"}, status_code=404)
         try:
             body, etag = b.roster.snapshot(key, agent_filter=[agent], status_filter=status_filter,
-                                           include_tasks=include_tasks)
+                                           availability_filter=availability_filter, include_tasks=include_tasks)
         except sqlite3.Error:
             return JSONResponse({"error": "degraded"}, status_code=503)
         return roster_response(req, body, etag)

@@ -27,12 +27,12 @@
 | 唯一状态变更入口 | `service.py:65-77` `Bridge._set_status` → `_emit`（`service.py:79-81`） | 所有状态变化（客户端、回调、超时、投递失败）都经过这里，是挂 roster 钩子的最佳位置 |
 | bot 如何被唤醒 | `service.py:224-251` `_enqueue_bot` 写 outbox；`service.py:336-354` outbox 循环；`service.py:356-412` `_deliver` | 2xx 即送达并转 working（`service.py:414-431`）；401/403/404 永久失败；限流识别 `service.py:25-27,378-379`；最终失败把任务置 failed（`service.py:394-403`） |
 | 投递健康（离线判断） | `db.py:39-52` `outbox(kind, task_id, attempts, status, last_error, next_at)`；`db.py:216-218` `outbox_stats` | outbox **没有 agent 列、没有送达时间戳** → 需要补 presence 表（§5） |
-| 超时/卡死 | `service.py:449-462` `sweep()`：submitted/working 超过 `task_timeout_s`(3600) → failed；input-required 超过 86400 → canceled；`_sweeper_loop` 每 `sweep_interval_s`(30s) 跑一次 `service.py:433-447` | “stuck” 定义为早于这个硬超时的软阈值 |
+| 超时/卡死 | `sweep()`：submitted/working 超过 `task_timeout_s`(3600) → failed（**`waiting_on=owner` 的 working 除外**）；input-required/auth-required 以及 `waiting_on=owner` 的 working 超过 `input_required_timeout_s`(86400) → canceled；`_sweeper_loop` 每 `sweep_interval_s`(30s) 跑一次 | “stuck” 定义为早于这个硬超时的软阈值 |
 | 健康信息 | `app.py:205-214` `/healthz`（db、outbox 统计、SSE 流数） | 只有全局，没有按 bot |
 | 流式机制 | `events.py` `EventBus`（按任意字符串 key 订阅，队列 1000，慢消费者丢弃）；SSE 生成器 `app.py:374-417`（`retry: 3000`、`: keepalive` 每 `sse_heartbeat_s`） | `/roster/stream` 直接复用，订阅一个特殊 key `"__roster__"`，EventBus 无需改 |
 | Webhook 推送机制 | `service.py:205-221` `_enqueue_push` → outbox kind=`push`；SSRF 校验 `security.py` `check_push_url` | roster webhook 订阅复用 outbox，新增 kind=`roster` |
 | Agent Card / skills | `config.py:67-83` `AgentConfig.skills / required_inputs / raw`；`app.py:134-182` `card()`，已有扩展 `urn:a2a-bridge:input-fields:v1` `app.py:163-166`；`GetExtendedAgentCard` 目前返回 Unsupported `app.py:338-339` | roster 的 capabilities 直接取 `skills[].id/name/tags` |
-| 限流 | `security.py` `RateLimiter`；中间件按 IP `app.py:117-131`，按 key `app.py:243-246` | `/roster` 走同样两层 |
+| 限流 | `security.py` `RateLimiter`；JSON-RPC 用 `ip:` / `key:` 桶，roster 用独立的 `ip-roster:` / `roster-key:` 桶 | 轮询 `/roster` 不消耗 JSON-RPC 配额 |
 | Bot 侧约定（skill 文档） | `docs/BOT-SIDE.md`：“只发 message 不发 state = 进度更新”、“超过 1 小时没有回调会被置 failed——长任务请定期发 working 进度”、回调可带 `metadata` | 这条约定就是事实上的**任务内心跳**；roster 只需在 skill 文档里补一个可选 metadata 字段（§4.3） |
 
 额外观察：
@@ -42,13 +42,13 @@
 
 ## 3. API 规格
 
-所有路径与 JSON-RPC 同一 host；认证与 RPC 完全一致：`Authorization: Bearer <API_KEY>` 或 `X-API-Key`（`app.py:235`）。响应 `Cache-Control: no-store`，带 `ETag`（快照哈希），支持 `If-None-Match` → 304。
+所有路径与 JSON-RPC 同一 host；认证：`Authorization: Bearer <API_KEY>` 或 `X-API-Key`。`A2A_ROSTER_PUBLIC=true` 时**只有完全不带 Authorization 头**才算匿名；带了错误/畸形头（如 `Basic`）一律 401。响应 `Cache-Control: no-store`，带 `ETag`（视图哈希，不含 `generatedAt` 与 `statusDurationS`），支持 `If-None-Match` → 304。GET 只读缓存，不写 presence、不触发重算。
 
 ### 3.1 `GET /roster`
 
-查询参数（均可选）：`agent=<name>`（可重复）、`status=idle,busy,...`、`include=tasks`（仅 owner 有效）。
+查询参数（均可选）：`agent=<name>`（可重复）、`availability=available,limited,unavailable`（任何 tier）、`status=idle,busy,...`（仅 trusted/owner；basic/anonymous → 403）、`include=tasks`（仅 owner 有效）。
 
-返回该 key 可调用的 bot（`key.agents is None` 则全部），不在范围内的 bot **不出现**（不报错，不泄露存在性；虽然 `/agents` 本身是公开的，但保持与 TaskNotFound 同样的原则）。
+返回该 key 可调用的 bot：**始终与 `key.agents` 求交**（owner tier 也一样；`agents is None` 才是全部）。非 owner 另外隐藏 `roster_visible=false`。不在范围内的 bot **不出现**（不报错，不泄露存在性；虽然 `/agents` 本身是公开的，但保持与 TaskNotFound 同样的原则）。
 
 trusted 视图示例：
 ```json
@@ -109,9 +109,10 @@ owner 视图在 trusted 基础上加：
 单个 bot，结构同上。key 无权或 agent 不存在 → 404（统一，不区分）。
 
 ### 3.3 `GET /roster/stream`（SSE）
-- 首帧 `event: snapshot`，data 为 §3.1 完整对象；之后只在**该订阅者可见视图发生变化**时发 `event: update`，data 为单个 agent 对象 + `"seq"`。
-- 每 `A2A_SSE_HEARTBEAT_S`(15s) `: keepalive`；`retry: 3000`；`id:` 为单调 seq，断线重连带 `Last-Event-ID` 时直接重发 snapshot（不做事件回放，roster 是状态而非日志）。
-- 每 key 最多 `A2A_ROSTER_MAX_STREAMS_PER_KEY`(默认 3) 条流。
+- 首帧 `event: snapshot`，data 为 §3.1 完整对象；之后只在**该订阅者可见视图发生变化**时发 `event: update`，data 为单个 agent 对象 + `"seq"`（**按本连接**递增，不暴露其他 agent 的变更频率）。
+- 每 `A2A_SSE_HEARTBEAT_S`(15s) `: keepalive`；`retry: 3000`；`id:` 为该连接的 seq，断线重连带 `Last-Event-ID` 时直接重发 snapshot（不做事件回放，roster 是状态而非日志）。
+- 上限：每 key `A2A_ROSTER_MAX_STREAMS_PER_KEY`(3)；全局 `A2A_ROSTER_MAX_STREAMS`(32)；匿名另计 `A2A_ROSTER_MAX_ANON_STREAMS`(3)。写出阻塞超过 `A2A_ROSTER_STREAM_TIMEOUT_S`(30s) 或连接超过 `A2A_ROSTER_STREAM_MAX_S`(300s) 则断开。
+- 路由：`/roster/stream` 是 SSE 入口，agent 名 `stream` **保留**（配置时报错）。
 ```
 event: update
 id: 1842
@@ -120,9 +121,10 @@ data: {"seq":1842,"agent":{"id":"code-reviewer","status":"stuck","statusSince":"
 
 实现说明（与代码一致的细节）：
 - `GET /roster/{agent}` 返回与列表相同的信封（`generatedAt` / `viewTier` / `ttlSeconds` / `stream` / `agents`），`agents` 仅含这一条。
-- `ETag` 是视图哈希，**不含** `generatedAt`（该字段每次请求都会变），因此 `If-None-Match` 可以 304。
+- `ETag` 是视图哈希，**不含** `generatedAt` 和 `statusDurationS`（后者每秒都会变），因此 `If-None-Match` 可以 304。
 - 非法 `waitingOn` 在回调里被忽略，不让整个 callback 失败。
 - 不主动探测 bot webhook。
+- 推断在后台循环（debounce + 最长等待 `A2A_ROSTER_DEBOUNCE_MAX_S`）和 sweeper `tick()` 里重算；`GET`/`SSE` 读缓存。`roster_signals` 不读 `status_json`（避免文件/base64）；outbox 有 `ix_outbox_task(task_id)` 与 `ix_outbox_kind_status(kind,status)`。
 
 ### 3.4 Webhook 订阅（阶段 3，未实现）
 - `POST /roster/subscriptions` body `{"url":"https://…","token":"…","agents":["code-reviewer"],"statuses":["idle","stuck","offline"]}` → `201 {"id":"rsub_…", ...}`
@@ -137,7 +139,7 @@ data: {"seq":1842,"agent":{"id":"code-reviewer","status":"stuck","statusSince":"
 | 401 | `{"error":"unauthorized"}` + `WWW-Authenticate: Bearer` | 无/错误 key（且未开启匿名访问） |
 | 404 | `{"error":"agent not found"}` | `/roster/{agent}` 不存在或不在 key 范围 |
 | 400 | `{"error":"invalid parameter","param":"status"}` | 非法查询参数、订阅 URL 不合规 |
-| 403 | `{"error":"forbidden"}` | basic key 创建 webhook 订阅、非 owner 用 `include=tasks` |
+| 403 | `{"error":"forbidden"}` | basic/anonymous 用 `status=` 过滤、非 owner 用 `include=tasks`、basic key 创建 webhook 订阅 |
 | 429 | `{"error":"rate limit exceeded"}` + `Retry-After` | 复用 IP/key 限流；或 SSE 流数超限 |
 | 503 | `{"error":"degraded"}` | DB 不可用（同 `/healthz`） |
 
@@ -158,7 +160,7 @@ GROUP BY agent, state;
 
 | 状态 | 规则 | 依据代码 |
 |---|---|---|
-| `offline` | 最近一次 bot 投递永久失败（401/403/404 或耗尽重试 → `outbox_dead`），且之后没有成功投递/回调；或连续 ≥3 次投递失败且最早一条 submitted 超过 `A2A_ROSTER_OFFLINE_AFTER_S`(120s) | `service.py:384-403`（dead 分支）、`service.py:405-412`（重试分支），`db.py:204-210` |
+| `offline` | 最近一次 bot 投递因 **HTTP 401/403/404** 永久失败（`delivery_dead`），且之后没有成功投递/回调，且失败仍在 `A2A_ROSTER_OFFLINE_TTL_S`(3600s) 内；或连续 ≥3 次投递失败且最早一条 submitted 超过 `A2A_ROSTER_OFFLINE_AFTER_S`(120s)（短暂 offline，不永久自锁）。500/网络耗尽重试**不会**打上 `delivery_dead`。 | `_deliver` dead 分支、`note_delivery_err(..., http_status=)` |
 | `stuck` | 存在 working 任务，`waiting_on` 不是 owner，且 `now - updated_at > stuck_after_s`（默认 `A2A_ROSTER_STUCK_AFTER_S`=900s，agents.json 可按 bot 覆盖 `stuck_after_s`，必须 < `task_timeout_s`）；或 submitted 任务已成功投递但超过 300s 没变 working | `updated_at` 刷新点：`db.py:111-120`、`service.py:291,302`；硬超时 `service.py:452-456` |
 | `busy` | working 数 ≥ 1（`active`）；若 `active ≥ maxConcurrent` 或最近投递命中限流（`_RATE_LIMIT_RE`）则 `availability=unavailable`、`throttled=true` | `service.py:414-431`（2xx 后转 working）、`service.py:25-27,378-379` |
 | `input-required` | 没有 working，但有 input-required/auth-required 任务，或 working 任务带 `waiting_on="owner"`；`waitingOn` ∈ `requester`/`owner`/`auth` | `models.py:18` `INTERRUPTED`；`service.py:298-302` |
@@ -174,14 +176,14 @@ GROUP BY agent, state;
 ### 4.3 “等待 owner 审批”怎么区分
 现状：A2A 的 `input-required` 意思是“请**请求方**补充输入”，bridge 无法区分“等外部请求方回答”和“等运营者（owner）审批”。而且如果是等 owner，对外部客户端返回 input-required 是错的（它无法提供这个输入）。
 
-方案：bot 在等 owner 审批时**保持 `working`**，回调带 `metadata: {"roster": {"waitingOn": "owner"}}`；bridge 在 `apply_callback`（`service.py:298-302`）把它写入 tasks 新列 `waiting_on`，下次有其他进展时清空。roster 把它显示成 `input-required / waitingOn=owner`，并从 stuck 判定中排除（改用 `input_required_timeout_s` 量级的阈值）。这算 bot 提供的提示而不是状态自报——状态本身仍由任务数据推出。需要在 `docs/BOT-SIDE.md` 增加一节说明（同时补 `publicActivity`，§6.2）。
+方案：bot 在等 owner 审批时**保持 `working`**，回调带 `metadata: {"roster": {"waitingOn": "owner"}}`；bridge 在 `apply_callback` 把它写入 tasks 新列 `waiting_on`，下次状态/消息进展（以及终态）时清空 `waiting_on` 与 `public_activity`（除非本次再次带上）。roster 把它显示成 `input-required / waitingOn=owner`，并从 stuck 判定中排除。硬超时走 `input_required_timeout_s`（canceled），**不会**在 `task_timeout_s`(1h) 被标 failed。这算 bot 提供的提示而不是状态自报——状态本身仍由任务数据推出。见 `docs/BOT-SIDE.md`。
 
 ### 4.4 为什么不做主动探测 / 空闲心跳
 对 Grok Bot 这类 webhook 驱动的 agent，webhook 本身就是自动化运行入口（参见 `service.py:25-27` 对平台限流响应的处理），任何探测都会触发一次运行并消耗限额。因此空闲 bot 的在线性只能从“最近一次投递/回调”推断。可选的第三阶段：允许 bot 用共享密钥签名 `POST /presence/{agent}` 做低频心跳——但这属于自报，默认关闭。
 
 ### 4.5 实时性
-- 事件驱动：`_set_status`（`service.py:65-77`）、`_deliver` 成功/失败（`service.py:369-375, 394-412`）、`apply_callback` 时调用 `roster.touch(agent)`，重算该 agent，1 秒内合并后发布到 EventBus key `"__roster__"`。
-- 时间驱动：stuck/offline 是“时间流逝”产生的变化，没有事件。在 `_sweeper_loop`（`service.py:433-447`）里加 `roster.tick()`，每 `sweep_interval_s`(30s) 重算一次 → stuck 检测延迟 ≤ 30s。
+- 事件驱动：`_set_status`、`_deliver` 成功/失败、`apply_callback` 时调用 `roster.touch(agent)`。后台循环在安静 `A2A_ROSTER_DEBOUNCE_S`(1s) **或** 脏数据已持续 `A2A_ROSTER_DEBOUNCE_MAX_S`(2s) 时重算并发布到 EventBus key `"__roster__"`（持续变更不会饿死 SSE）。
+- 时间驱动：stuck/offline 是“时间流逝”产生的变化。`_sweeper_loop` 里 `roster.tick()` 每 `sweep_interval_s`(30s) 重算一次 → stuck 检测延迟 ≤ 30s。HTTP GET 不重算。
 
 ## 5. 数据模型变更
 
@@ -203,13 +205,17 @@ CREATE TABLE IF NOT EXISTS agent_presence (
 -- tasks 新列（沿用 Store.__init__ 的 ALTER TABLE 迁移写法，启动时自动执行）
 ALTER TABLE tasks ADD COLUMN waiting_on TEXT;         -- requester|owner|auth|NULL
 ALTER TABLE tasks ADD COLUMN public_activity TEXT;    -- bot 提供的脱敏摘要，≤120 字符
+ALTER TABLE tasks ADD COLUMN status_text TEXT;        -- 从 status_json 抽出的纯文本，推断用，避免读大 JSON
 CREATE INDEX IF NOT EXISTS ix_tasks_agent_state ON tasks(agent, state, updated_at);
+CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id);
+CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status);
 -- 阶段 3（未实现）才会需要 roster_subscriptions
 ```
 配置新增：
 - agents.json 每个 agent 可选：`max_concurrent`（默认 1）、`stuck_after_s`、`roster_visible`（默认 true，可把内部 bot 从 roster 隐藏）。
-- 环境变量：`A2A_KEY_TIERS`（如 `ops:owner,partner-1:trusted`，未列出默认 `basic`）、`A2A_ROSTER_STUCK_AFTER_S`(900)、`A2A_ROSTER_OFFLINE_AFTER_S`(120)、`A2A_ROSTER_MAX_STREAMS_PER_KEY`(3)、`A2A_ROSTER_PUBLIC`(false，是否允许匿名看 availability)、`A2A_ROSTER_REDACT`（逗号分隔的敏感词/正则）、`A2A_ROSTER_DEBOUNCE_S`(1，SSE 发布合并窗口)。`A2A_ALERT_WEBHOOK_URL` 属于阶段 3，尚未使用。
-- `ApiKey` 增加 `tier: str = "basic"`（`config.py:60-63`），由 `A2A_KEY_TIERS` 填充；**不改** `A2A_API_KEYS` 语法，向后兼容。
+- 环境变量：`A2A_KEY_TIERS`（如 `ops:owner,partner-1:trusted`，未列出默认 `basic`）、`A2A_ROSTER_STUCK_AFTER_S`(900)、`A2A_ROSTER_OFFLINE_AFTER_S`(120)、`A2A_ROSTER_OFFLINE_TTL_S`(3600)、`A2A_ROSTER_MAX_STREAMS_PER_KEY`(3)、`A2A_ROSTER_MAX_STREAMS`(32)、`A2A_ROSTER_MAX_ANON_STREAMS`(3)、`A2A_ROSTER_STREAM_TIMEOUT_S`(30)、`A2A_ROSTER_STREAM_MAX_S`(300)、`A2A_ROSTER_PUBLIC`(false，是否允许匿名看 availability)、`A2A_ROSTER_REDACT`（逗号分隔的敏感词/正则）、`A2A_ROSTER_DEBOUNCE_S`(1)、`A2A_ROSTER_DEBOUNCE_MAX_S`(2)。`A2A_ALERT_WEBHOOK_URL` 属于阶段 3，尚未使用。
+- `ApiKey` 增加 `tier: str = "basic"`，由 `A2A_KEY_TIERS` 填充；**不改** `A2A_API_KEYS` 语法，向后兼容。owner 仍与 `key.agents` 求交。
+- 迁移：`Store._migrate` 使用 `BEGIN IMMEDIATE`，`ALTER TABLE` 对已存在列容忍 duplicate column；启动时补 `status_text` 与 outbox 索引。agent 名 `stream` 保留。配置解析错误不回显密钥片段。
 
 ## 6. 隐私分级
 
@@ -217,7 +223,7 @@ CREATE INDEX IF NOT EXISTS ix_tasks_agent_state ON tasks(agent, state, updated_a
 
 | 字段 | anonymous（需 `A2A_ROSTER_PUBLIC=true`） | basic（默认 key） | trusted | owner |
 |---|---|---|---|---|
-| id/name/url/card/skills | ✓（仅公开 agent） | ✓（key 范围内） | ✓ | ✓ 全部 agent |
+| id/name/url/card/skills | ✓（仅公开 agent） | ✓（key 范围内） | ✓ | ✓ key 范围内（含 `roster_visible=false`） |
 | availability | ✓ | ✓ | ✓ | ✓ |
 | status / waitingOn | — | — | ✓ | ✓ |
 | statusDurationS | — | 取整到分钟 | ✓ | ✓ |
@@ -233,7 +239,7 @@ CREATE INDEX IF NOT EXISTS ix_tasks_agent_state ON tasks(agent, state, updated_a
 2. trusted 看到的 activity 来源优先级：
    a. bot 在回调里提供的 `metadata.roster.publicActivity`（BOT-SIDE.md 约定：不含项目/仓库/人名/URL，≤120 字符），存入 `tasks.public_activity`；
    b. 否则用模板：`"Working on a <skill name> task"` / `"Waiting for requester input"` / `"Waiting for owner approval"`（skill 名来自 agents.json，可公开）。
-3. 即使是 (a) 也过一遍清洗：去掉 URL、邮箱、`org/repo` 形式、长 hex/uuid，命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，截断 120 字符。
+3. 即使是 (a) 也过一遍清洗：去掉 URL、邮箱、`org/repo`、长 hex/uuid、私网/回环 IP、内网主机名与常见域名、GitHub/AWS token、JWT、电话号码，命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，截断 120 字符。
 4. 请求方是自己的 key 时（`tasks.owner == key.label`），该 key 可以看到**自己任务**的原始状态消息——这和它通过 `tasks/get` 已经能拿到的信息一致，不额外泄露。
 
 ## 7. Agent Card 扩展与 A2A 兼容性

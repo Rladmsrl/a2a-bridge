@@ -122,9 +122,15 @@ class Settings:
     roster_stuck_after_s: int = 900
     roster_offline_after_s: int = 120
     roster_max_streams_per_key: int = 3
+    roster_max_streams: int = 32
+    roster_max_anon_streams: int = 3
+    roster_stream_timeout_s: float = 30.0
+    roster_stream_max_s: float = 300.0
     roster_public: bool = False
     roster_redact: list[str] = field(default_factory=list)
     roster_debounce_s: float = 1.0
+    roster_debounce_max_s: float = 2.0
+    roster_offline_ttl_s: int = 3600
 
 
 def parse_api_keys(spec: str) -> list[ApiKey]:
@@ -135,7 +141,7 @@ def parse_api_keys(spec: str) -> list[ApiKey]:
     keys: list[ApiKey] = []
     for entry in [e.strip() for e in spec.split(",") if e.strip()]:
         if "=" not in entry:
-            raise ConfigError(f"A2A_API_KEYS entry must be label=sha256:<hex> or label=plain:<key>: {entry[:12]}...")
+            raise ConfigError("A2A_API_KEYS entry must be label=sha256:<hex> or label=plain:<key>")
         label, rest = entry.split("=", 1)
         agents = None
         if "@" in rest:
@@ -162,7 +168,7 @@ def parse_key_tiers(spec: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for entry in [e.strip() for e in spec.split(",") if e.strip()]:
         if ":" not in entry:
-            raise ConfigError(f"A2A_KEY_TIERS entry must be label:tier: {entry[:24]}...")
+            raise ConfigError("A2A_KEY_TIERS entry must be label:tier")
         label, tier = entry.split(":", 1)
         label, tier = label.strip(), tier.strip().lower()
         if not label or tier not in KEY_TIERS:
@@ -185,6 +191,8 @@ def load_agents(path: str, env: dict) -> dict[str, AgentConfig]:
         name = a.get("name", "")
         if not name or not all(c.isalnum() or c in "-_" for c in name):
             raise ConfigError(f"invalid agent name: {name!r} (use [A-Za-z0-9_-])")
+        if name == "stream":
+            raise ConfigError("agent name 'stream' is reserved (GET /roster/stream)")
         tok_env = a.get("webhook_token_env")
         sec_env = a.get("shared_secret_env")
         if not tok_env or not sec_env:
@@ -298,7 +306,13 @@ def load_settings(env: dict | None = None) -> Settings:
         roster_stuck_after_s=_int(env, "A2A_ROSTER_STUCK_AFTER_S", 900),
         roster_offline_after_s=_int(env, "A2A_ROSTER_OFFLINE_AFTER_S", 120),
         roster_max_streams_per_key=_int(env, "A2A_ROSTER_MAX_STREAMS_PER_KEY", 3),
+        roster_max_streams=_int(env, "A2A_ROSTER_MAX_STREAMS", 32),
+        roster_max_anon_streams=_int(env, "A2A_ROSTER_MAX_ANON_STREAMS", 3),
+        roster_stream_timeout_s=_float(env, "A2A_ROSTER_STREAM_TIMEOUT_S", 30.0),
+        roster_stream_max_s=_float(env, "A2A_ROSTER_STREAM_MAX_S", 300.0),
         roster_public=_bool(env, "A2A_ROSTER_PUBLIC", False),
         roster_redact=redact,
         roster_debounce_s=_float(env, "A2A_ROSTER_DEBOUNCE_S", 1.0),
+        roster_debounce_max_s=_float(env, "A2A_ROSTER_DEBOUNCE_MAX_S", 2.0),
+        roster_offline_ttl_s=_int(env, "A2A_ROSTER_OFFLINE_TTL_S", 3600),
     )

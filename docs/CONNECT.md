@@ -182,11 +182,13 @@ curl -s https://<bridge-host>/roster/<agent> -H "Authorization: Bearer $A2A_KEY"
 curl -N https://<bridge-host>/roster/stream -H "Authorization: Bearer $A2A_KEY"
 ```
 
-- 每个 key 只能看到自己被允许调用的 agent；无权或不存在的单条查询一律 404。
-- 查询参数（可选）：`agent=<name>`（可重复）、`status=idle,busy,input-required,stuck,offline`、`include=tasks`（仅 owner key）。
-- 响应 `Cache-Control: no-store`，带 `ETag`；`If-None-Match` 可 304。
-- SSE：首帧 `event: snapshot`，变化时 `event: update`；`: keepalive` 与任务流相同。每 key 默认最多 3 条 roster 流（`A2A_ROSTER_MAX_STREAMS_PER_KEY`）。
+- 每个 key 只能看到自己被允许调用的 agent（`A2A_API_KEYS` 的 `@agent` 范围始终生效，owner tier 也不例外）；无权或不存在的单条查询一律 404。
+- 查询参数（可选）：`agent=<name>`（可重复）、`availability=available,limited,unavailable`（任何 tier）、`status=idle,busy,input-required,stuck,offline`（仅 trusted/owner；basic/anonymous 用 `status=` 会 403）、`include=tasks`（仅 owner key）。
+- 响应 `Cache-Control: no-store`，带 `ETag`（不含 `generatedAt` / `statusDurationS`）；`If-None-Match` 可 304。
+- GET 是只读快照（后台推断缓存）；SSE：首帧 `event: snapshot`，变化时 `event: update`（`seq` 按本连接递增）；`: keepalive` 与任务流相同。每 key 默认最多 3 条 roster 流，全局默认 32，匿名（`A2A_ROSTER_PUBLIC`）另有独立上限 3。慢客户端写超时后断开。
+- `GET /roster/stream` 是 SSE；agent 名 `stream` 保留，不能配置。
 - 字段多少取决于 key 的隐私等级（`A2A_KEY_TIERS`，默认 `basic`）：basic 只有粗粒度 `availability`（available / limited / unavailable）；`trusted` 有 status / activity / capacity；`owner` 另有投递错误与（可选）任务列表。详见 [roster-design.md](roster-design.md)。
+- 公开模式下未带 `Authorization` 可看 availability；带了但格式错误或密钥无效一律 401（不会降级成匿名）。
 
 ## 10. 错误码
 
@@ -203,7 +205,7 @@ curl -N https://<bridge-host>/roster/stream -H "Authorization: Bearer $A2A_KEY"
 | -32004 | UnsupportedOperation（例如向终态任务发消息；v1 订阅终态任务） |
 | -32005 | ContentTypeNotSupported |
 | -32009 | VersionNotSupported（`A2A-Version` 只接受空、`0.3`、`1.0`） |
-| HTTP 401/403/404/413/429 | 未认证 / 无权限 / roster 中 agent 不存在或不在 key 范围 / 请求体过大 / 限流 |
+| HTTP 401/403/404/413/429 | 未认证（含畸形 Authorization） / 无权限（如 basic 用 `status=`、`include=tasks`） / roster 中 agent 不存在或不在 key 范围 / 请求体过大 / 限流 |
 
 ## 11. 任务状态
 

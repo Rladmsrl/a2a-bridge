@@ -12,6 +12,18 @@ from typing import Any
 
 UNSET = object()
 
+
+def _text_from_status(status: dict) -> str | None:
+    msg = status.get("message")
+    if not isinstance(msg, dict):
+        return None
+    texts = [p.get("text") for p in (msg.get("parts") or [])
+             if isinstance(p, dict) and p.get("kind") == "text" and isinstance(p.get("text"), str) and p["text"]]
+    if not texts:
+        return None
+    t = "\n".join(texts)
+    return t[:500]
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -24,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   metadata_json TEXT,
   waiting_on TEXT,
   public_activity TEXT,
+  status_text TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -56,6 +69,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_due ON outbox(status, next_at);
+CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id);
+CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status);
 CREATE TABLE IF NOT EXISTS push_configs (
   task_id TEXT NOT NULL,
   id TEXT NOT NULL,
@@ -101,20 +116,39 @@ class Store:
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA busy_timeout=5000")
             self._db.executescript(SCHEMA)
-            cols = {r[1] for r in self._db.execute("PRAGMA table_info(outbox)")}
-            if "client_err_retries" not in cols:  # migration
-                self._db.execute("ALTER TABLE outbox ADD COLUMN client_err_retries INTEGER NOT NULL DEFAULT 0")
-            tcols = {r[1] for r in self._db.execute("PRAGMA table_info(tasks)")}
-            if "waiting_on" not in tcols:
-                self._db.execute("ALTER TABLE tasks ADD COLUMN waiting_on TEXT")
-            if "public_activity" not in tcols:
-                self._db.execute("ALTER TABLE tasks ADD COLUMN public_activity TEXT")
-            pcols = {r[1] for r in self._db.execute("PRAGMA table_info(agent_presence)")}
-            if pcols and "delivery_dead" not in pcols:
-                self._db.execute(
-                    "ALTER TABLE agent_presence ADD COLUMN delivery_dead INTEGER NOT NULL DEFAULT 0")
-            # crash recovery: deliveries that were in flight are retried
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent column/index adds. BEGIN IMMEDIATE serializes concurrent startups."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._ensure_column("outbox", "client_err_retries", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("tasks", "waiting_on", "TEXT")
+            self._ensure_column("tasks", "public_activity", "TEXT")
+            self._ensure_column("tasks", "status_text", "TEXT")
+            self._ensure_column("agent_presence", "delivery_dead", "INTEGER NOT NULL DEFAULT 0")
+            self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id)")
+            self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status)")
             self._db.execute("UPDATE outbox SET status='pending' WHERE status='inflight'")
+            self._db.execute("COMMIT")
+        except Exception:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _ensure_column(self, table: str, name: str, decl: str) -> None:
+        if table not in {"tasks", "outbox", "agent_presence"} or not name.replace("_", "").isalnum():
+            raise ValueError("invalid migration target")
+        cols = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+        if name in cols:
+            return
+        try:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -132,9 +166,9 @@ class Store:
                     metadata: dict | None) -> None:
         t = time.time()
         self._x("INSERT INTO tasks(id,context_id,agent,owner,state,status_json,artifacts_json,metadata_json,"
-                "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "status_text,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, context_id, agent, owner, status["state"], json.dumps(status), "[]",
-                 json.dumps(metadata) if metadata else None, t, t))
+                 json.dumps(metadata) if metadata else None, _text_from_status(status), t, t))
 
     def get_task(self, task_id: str) -> dict | None:
         r = self._x("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -144,8 +178,8 @@ class Store:
                     waiting_on: Any = UNSET, public_activity: Any = UNSET) -> None:
         sets, args = ["updated_at=?"], [time.time()]
         if status is not None:
-            sets += ["state=?", "status_json=?"]
-            args += [status["state"], json.dumps(status)]
+            sets += ["state=?", "status_json=?", "status_text=?"]
+            args += [status["state"], json.dumps(status), _text_from_status(status)]
         if artifacts is not None:
             sets.append("artifacts_json=?")
             args.append(json.dumps(artifacts))
@@ -311,24 +345,22 @@ class Store:
         self._x(f"UPDATE agent_presence SET {', '.join(sets)} WHERE agent=?", tuple(args))
 
     def roster_signals(self, hour_ago: float) -> dict[str, Any]:
-        """One lock: active tasks plus the aggregates roster inference needs."""
-        with self._lock:
-            active = [dict(r) for r in self._db.execute(
-                "SELECT id,context_id,agent,owner,state,status_json,waiting_on,public_activity,"
-                "created_at,updated_at FROM tasks "
-                "WHERE state IN ('submitted','working','input-required','auth-required')")]
-            failed = {r[0]: r[1] for r in self._db.execute(
-                "SELECT agent, COUNT(*) FROM tasks WHERE state='failed' AND updated_at>=? GROUP BY agent",
-                (hour_ago,))}
-            last_term = {r[0]: r[1] for r in self._db.execute(
-                "SELECT agent, MAX(updated_at) FROM tasks WHERE state IN "
-                "('completed','failed','canceled','rejected') GROUP BY agent")}
-            pending = {r[0]: r[1] for r in self._db.execute(
-                "SELECT t.agent, COUNT(*) FROM outbox o JOIN tasks t ON t.id=o.task_id "
-                "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent")}
-            delivered_sub = {r[0] for r in self._db.execute(
-                "SELECT t.id FROM tasks t JOIN outbox o ON o.task_id=t.id "
-                "AND o.kind='bot' AND o.status='done' WHERE t.state='submitted'")}
-            presence = {r["agent"]: dict(r) for r in self._db.execute("SELECT * FROM agent_presence")}
+        """Cheap aggregates for roster inference. Does not load status_json (may contain files)."""
+        active = [dict(r) for r in self._x(
+            "SELECT id,agent,owner,state,waiting_on,public_activity,status_text,created_at,updated_at "
+            "FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')").fetchall()]
+        failed = {r[0]: r[1] for r in self._x(
+            "SELECT agent, COUNT(*) FROM tasks WHERE state='failed' AND updated_at>=? GROUP BY agent",
+            (hour_ago,)).fetchall()}
+        last_term = {r[0]: r[1] for r in self._x(
+            "SELECT agent, MAX(updated_at) FROM tasks WHERE state IN "
+            "('completed','failed','canceled','rejected') GROUP BY agent").fetchall()}
+        pending = {r[0]: r[1] for r in self._x(
+            "SELECT t.agent, COUNT(*) FROM outbox o JOIN tasks t ON t.id=o.task_id "
+            "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent").fetchall()}
+        delivered_sub = {r[0] for r in self._x(
+            "SELECT t.id FROM tasks t JOIN outbox o ON o.task_id=t.id "
+            "AND o.kind='bot' AND o.status='done' WHERE t.state='submitted'").fetchall()}
+        presence = {r["agent"]: dict(r) for r in self._x("SELECT * FROM agent_presence").fetchall()}
         return {"active": active, "failed_hour": failed, "last_terminal": last_term,
                 "outbox_pending": pending, "delivered_submitted": delivered_sub, "presence": presence}

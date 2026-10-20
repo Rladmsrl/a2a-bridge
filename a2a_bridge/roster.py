@@ -1,9 +1,14 @@
 """Live agent roster: infer status from existing task/delivery data (never probe bots),
-project a privacy-tiered view per API key, and publish changes for SSE subscribers."""
+project a privacy-tiered view per API key, and publish changes for SSE subscribers.
+
+GET /roster and SSE snapshot/update read a cache that is recomputed in the background
+(debounce loop + sweeper tick). Reads do not write presence or recompute.
+"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -12,7 +17,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from . import models as M
 from .config import ApiKey, Settings
 from .db import Store
 from .events import EventBus
@@ -21,10 +25,13 @@ log = logging.getLogger("a2a_bridge.roster")
 
 ROSTER_BUS_KEY = "__roster__"
 VALID_STATUSES = ("offline", "stuck", "busy", "input-required", "idle")
+VALID_AVAILABILITY = ("available", "limited", "unavailable")
 TTL_SECONDS = 5
 SUBMITTED_STUCK_S = 300
 CONFIDENCE_HIGH_S = 600
 CONFIDENCE_MEDIUM_S = 86400
+ANON_STREAM_LABEL = "*"
+AUTH_DEAD_STATUSES = {401, 403, 404}
 
 _URL_RE = re.compile(r"https?://[^\s]+|www\.[^\s]+", re.I)
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")
@@ -33,6 +40,21 @@ _UUID_RE = re.compile(
 _HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
 _REPO_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]+/[A-Za-z0-9._-]+\b")
 _MIME_LEFT = {"text", "application", "image", "audio", "video", "multipart", "font", "model"}
+_IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
+_IPV6_RE = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
+_INTERNAL_HOST_RE = re.compile(
+    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:local|internal|lan|corp|home|intranet)\b",
+    re.I)
+_DNS_HOST_RE = re.compile(
+    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:com|net|org|edu|io|ai|app|dev|cloud|co|info|gov|biz)\b",
+    re.I)
+_GITHUB_TOKEN_RE = re.compile(
+    r"\b(?:gh[pours]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
+_AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?){2}\d{2,4}(?!\w)")
 
 
 def ts_to_iso(ts: float | None) -> str | None:
@@ -62,6 +84,14 @@ def etag_of(obj: Any) -> str:
     return f'"{hashlib.sha256(raw).hexdigest()[:16]}"'
 
 
+def etag_of_roster(body: dict) -> str:
+    """ETag ignores generatedAt (request time) and statusDurationS (ticks every second)."""
+    agents = [{k: v for k, v in a.items() if k != "statusDurationS"} for a in body.get("agents", [])]
+    payload = {k: v for k, v in body.items() if k not in ("generatedAt", "agents")}
+    payload["agents"] = agents
+    return etag_of(payload)
+
+
 def compile_redact(patterns: list[str]) -> list[re.Pattern]:
     out: list[re.Pattern] = []
     for p in patterns:
@@ -72,13 +102,31 @@ def compile_redact(patterns: list[str]) -> list[re.Pattern]:
     return out
 
 
+def _redact_ip(m: re.Match) -> str:
+    try:
+        ip = ipaddress.ip_address(m.group(0))
+    except ValueError:
+        return m.group(0)
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        return "[redacted]"
+    return m.group(0)
+
+
 def redact_text(text: str, extra: list[re.Pattern]) -> str:
     if not text:
         return text
     s = _URL_RE.sub("[redacted]", text)
     s = _EMAIL_RE.sub("[redacted]", s)
+    s = _JWT_RE.sub("[redacted]", s)
+    s = _GITHUB_TOKEN_RE.sub("[redacted]", s)
+    s = _AWS_KEY_RE.sub("[redacted]", s)
     s = _UUID_RE.sub("[redacted]", s)
     s = _HEX_RE.sub("[redacted]", s)
+    s = _IPV4_RE.sub(_redact_ip, s)
+    s = _IPV6_RE.sub(_redact_ip, s)
+    s = _INTERNAL_HOST_RE.sub("[redacted]", s)
+    s = _DNS_HOST_RE.sub("[redacted]", s)
+    s = _PHONE_RE.sub("[redacted]", s)
 
     def _repo(m: re.Match) -> str:
         left = m.group(0).split("/", 1)[0]
@@ -93,26 +141,14 @@ def redact_text(text: str, extra: list[re.Pattern]) -> str:
     return s[:120].rstrip() if len(s) > 120 else s
 
 
-def _status_text(row: dict) -> str | None:
-    try:
-        st = json.loads(row.get("status_json") or "{}")
-    except json.JSONDecodeError:
+def _row_text(row: dict | None) -> str | None:
+    if not row:
         return None
-    msg = st.get("message")
-    if isinstance(msg, dict) and msg.get("parts"):
-        t = M.text_of(msg["parts"])
-        return t or None
-    return None
+    t = row.get("status_text")
+    return t or None
 
 
-def _status_ts(row: dict) -> float:
-    try:
-        st = json.loads(row.get("status_json") or "{}")
-        t = iso_to_ts(st.get("timestamp"))
-        if t is not None:
-            return t
-    except json.JSONDecodeError:
-        pass
+def _row_ts(row: dict) -> float:
     return float(row["updated_at"])
 
 
@@ -136,6 +172,11 @@ def _fp(rec: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def view_fp(projected: dict) -> str:
+    payload = {k: v for k, v in projected.items() if k != "statusDurationS"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
 class Roster:
     def __init__(self, settings: Settings, store: Store, bus: EventBus):
         self.s = settings
@@ -145,6 +186,7 @@ class Roster:
         self._last: dict[str, dict] = {}
         self._dirty: set[str] = set()
         self._last_touch = 0.0
+        self._dirty_since = 0.0
         self._streams: dict[str, int] = {}
         self._stream_lock = threading.Lock()
         self._redact = compile_redact(settings.roster_redact)
@@ -162,10 +204,12 @@ class Roster:
         self.touch(agent)
 
     def note_delivery_err(self, agent: str, err: str, *, dead: bool, rate_limited: bool,
-                          retry_in_s: float = 0.0, now: float | None = None) -> None:
+                          retry_in_s: float = 0.0, now: float | None = None,
+                          http_status: int | None = None) -> None:
         now = time.time() if now is None else now
         fields: dict[str, Any] = {"last_delivery_err_at": now, "last_delivery_err": (err or "")[:200]}
-        if dead:
+        # Only auth-shaped permanent failures lock the agent offline (with TTL).
+        if dead and http_status in AUTH_DEAD_STATUSES:
             fields["delivery_dead"] = 1
         if rate_limited:
             fields["throttled_until"] = now + max(float(retry_in_s), 1.0)
@@ -174,6 +218,8 @@ class Roster:
 
     def touch(self, agent: str) -> None:
         if agent:
+            if not self._dirty:
+                self._dirty_since = time.monotonic()
             self._dirty.add(agent)
             self._last_touch = time.monotonic()
 
@@ -183,12 +229,25 @@ class Roster:
     def last(self, name: str) -> dict | None:
         return self._last.get(name)
 
+    def with_duration(self, rec: dict, now: float | None = None) -> dict:
+        now = time.time() if now is None else now
+        out = dict(rec)
+        out["statusDurationS"] = max(0, int(now - rec["since"]))
+        return out
+
     # ------------------------------------------------------------------ streaming caps
     def acquire_stream(self, label: str) -> bool:
-        cap = max(1, self.s.roster_max_streams_per_key)
+        per_key = max(1, self.s.roster_max_streams_per_key)
+        global_cap = max(1, self.s.roster_max_streams)
+        anon_cap = max(1, self.s.roster_max_anon_streams)
         with self._stream_lock:
+            total = sum(self._streams.values())
+            if total >= global_cap:
+                return False
+            if label == ANON_STREAM_LABEL and self._streams.get(ANON_STREAM_LABEL, 0) >= anon_cap:
+                return False
             n = self._streams.get(label, 0)
-            if n >= cap:
+            if n >= per_key:
                 return False
             self._streams[label] = n + 1
             return True
@@ -208,7 +267,10 @@ class Roster:
                 await asyncio.sleep(delay)
                 if not self._dirty:
                     continue
-                if time.monotonic() - self._last_touch < self.s.roster_debounce_s:
+                nowm = time.monotonic()
+                quiet = nowm - self._last_touch
+                age = nowm - self._dirty_since
+                if quiet < self.s.roster_debounce_s and age < self.s.roster_debounce_max_s:
                     continue
                 names = self._dirty.copy()
                 self._dirty.clear()
@@ -220,12 +282,12 @@ class Roster:
 
     # ------------------------------------------------------------------ scope
     def visible_names(self, key: ApiKey) -> list[str]:
+        """Always intersect with key.agents (owner included). Non-owner also hides roster_visible=false."""
         names = list(self.s.agents)
-        if key.tier == "owner":
-            return names
-        names = [n for n in names if self.s.agents[n].roster_visible]
         if key.agents is not None:
             names = [n for n in names if n in key.agents]
+        if key.tier != "owner":
+            names = [n for n in names if self.s.agents[n].roster_visible]
         return names
 
     # ------------------------------------------------------------------ infer + persist
@@ -246,26 +308,29 @@ class Roster:
             self._last[name] = rec
             if changed:
                 self.seq += 1
-                self.bus.publish(ROSTER_BUS_KEY, {"seq": self.seq, "agent": name})
+                self.bus.publish(ROSTER_BUS_KEY, {"agent": name})
         return {n: out[n] for n in targets if n in out} if names is not None else out
 
     def snapshot(self, key: ApiKey, *, agent_filter: list[str] | None = None,
-                 status_filter: set[str] | None = None, include_tasks: bool = False,
-                 now: float | None = None) -> tuple[dict, str]:
+                 status_filter: set[str] | None = None, availability_filter: set[str] | None = None,
+                 include_tasks: bool = False, now: float | None = None) -> tuple[dict, str]:
+        """Serve from cache only. Duration is derived from `since` at request time."""
         now = time.time() if now is None else now
-        recs = self.recompute(now=now)
         names = self.visible_names(key)
         if agent_filter:
             want = set(agent_filter)
             names = [n for n in names if n in want]
         agents = []
         for n in names:
-            rec = recs.get(n)
+            rec = self._last.get(n)
             if rec is None:
                 continue
-            if status_filter and rec["status"] not in status_filter:
+            live = self.with_duration(rec, now)
+            if status_filter and live["status"] not in status_filter:
                 continue
-            agents.append(self.project(rec, key, include_tasks=include_tasks))
+            if availability_filter and live["availability"] not in availability_filter:
+                continue
+            agents.append(self.project(live, key, include_tasks=include_tasks))
         body = {
             "generatedAt": ts_to_iso(now),
             "viewTier": key.tier,
@@ -273,8 +338,7 @@ class Roster:
             "stream": f"{self.s.public_base_url}/roster/stream",
             "agents": agents,
         }
-        # generatedAt is request-time; ETag reflects the agent view so If-None-Match can 304
-        return body, etag_of({k: v for k, v in body.items() if k != "generatedAt"})
+        return body, etag_of_roster(body)
 
     def _infer(self, name: str, now: float, sig: dict) -> dict:
         agent = self.s.agents[name]
@@ -297,9 +361,11 @@ class Roster:
         throttled = bool(throttled_until and throttled_until > now)
         consec = int(presence.get("consecutive_failures") or 0)
         dead = bool(presence.get("delivery_dead"))
+        ttl = max(1, self.s.roster_offline_ttl_s)
+        auth_lock = dead and last_err is not None and (now - float(last_err)) <= ttl
 
         status = "idle"
-        if dead and (last_seen is None or last_err is None or last_seen <= last_err):
+        if auth_lock and (last_seen is None or last_err is None or last_seen <= last_err):
             status = "offline"
         elif consec >= 3 and oldest_sub is not None and (now - oldest_sub) >= self.s.roster_offline_after_s:
             status = "offline"
@@ -346,7 +412,7 @@ class Roster:
 
         primary = self._primary(status, tasks, stuck_after, now, sig["delivered_submitted"])
         public = (primary.get("public_activity") if primary else None) or None
-        raw = _status_text(primary) if primary else None
+        raw = _row_text(primary)
         skill = _skill_name(agent)
         activity = self._activity(status, waiting_on, public)
         if not activity and status in ("busy", "stuck"):
@@ -357,7 +423,7 @@ class Roster:
 
         own_activity: dict[str, str] = {}
         for t in sorted(tasks, key=lambda x: x["updated_at"]):
-            txt = _status_text(t)
+            txt = _row_text(t)
             if txt:
                 own_activity[t["owner"]] = txt
 
@@ -432,12 +498,12 @@ class Roster:
         if status in ("busy", "stuck"):
             working = [t for t in tasks if t["state"] == "working"]
             if working:
-                return min(_status_ts(t) for t in working)
+                return min(_row_ts(t) for t in working)
         if status == "input-required":
             cand = [t for t in tasks if t["state"] in ("input-required", "auth-required")
                     or t.get("waiting_on") == "owner"]
             if cand:
-                return min(_status_ts(t) for t in cand)
+                return min(_row_ts(t) for t in cand)
         if status == "offline":
             return float(presence["last_delivery_err_at"]) if presence.get("last_delivery_err_at") else now
         if status == "idle":

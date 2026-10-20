@@ -1,6 +1,7 @@
 """Roster: status inference, key scoping, privacy tiers, SSE, and DB migration."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -10,23 +11,26 @@ import httpx
 import pytest
 
 from a2a_bridge.app import create_app
-from a2a_bridge.config import ConfigError, load_settings
+from a2a_bridge.config import ConfigError, load_settings, parse_api_keys
 from a2a_bridge.db import Store
 from a2a_bridge.events import EventBus
 from a2a_bridge.roster import Roster, redact_text, ts_to_iso
 from a2a_bridge.security import callback_token
+from a2a_bridge.service import Bridge
 from conftest import API_KEY, BOT_SECRET, LIMITED_KEY, Server, free_port, make_env, rpc, user_msg, wait_state
 
 OWNER_KEY = "owner-key-0123456789abcd"  # gitleaks:allow (test fixture)
+OWNER_SCOPED_KEY = "owner-scoped-01234567ab"  # gitleaks:allow (test fixture)
 TRUSTED_KEY = "trusted-key-0123456789ab"  # gitleaks:allow (test fixture)
 
 
 def _roster_env(tmp_path, bot_port, bridge_port, **extra):
     keys = (f"main=plain:{API_KEY},lim=plain:{LIMITED_KEY}@other,"
-            f"ops=plain:{OWNER_KEY},trust=plain:{TRUSTED_KEY}")
+            f"ops=plain:{OWNER_KEY},ops2=plain:{OWNER_SCOPED_KEY}@other,"
+            f"trust=plain:{TRUSTED_KEY}")
     env = make_env(tmp_path, bot_port, bridge_port,
                    A2A_API_KEYS=keys,
-                   A2A_KEY_TIERS="ops:owner,trust:trusted",
+                   A2A_KEY_TIERS="ops:owner,ops2:owner,trust:trusted",
                    A2A_ROSTER_DEBOUNCE_S="0.05",
                    A2A_ROSTER_REDACT="secretproject",
                    **extra)
@@ -52,8 +56,9 @@ def _insert_task(store: Store, *, tid: str, agent="coder", owner="main", state="
                              "parts": [{"kind": "text", "text": message}]}
     store.create_task(tid, "ctx-" + tid, agent, owner, status, None)
     store._x(
-        "UPDATE tasks SET state=?, status_json=?, updated_at=?, created_at=?, waiting_on=?, public_activity=? WHERE id=?",
-        (state, json.dumps(status), ts, created, waiting_on, public_activity, tid))
+        "UPDATE tasks SET state=?, status_json=?, status_text=?, updated_at=?, created_at=?, "
+        "waiting_on=?, public_activity=? WHERE id=?",
+        (state, json.dumps(status), message, ts, created, waiting_on, public_activity, tid))
 
 
 def _status(roster: Roster, name="coder", now=None):
@@ -193,6 +198,19 @@ def test_redact_urls_emails_repos_and_custom(tmp_path):
     assert "[redacted]" in out
     assert "text/plain" == redact_text("text/plain", [])  # mime type kept
     assert s.roster_redact == ["secretproject"]
+    broad = ("host db.internal.corp ip 10.0.0.5 and 192.168.1.8 token "
+             "ghp_abcdefghijklmnopqrstuvwxyz012345 aws AKIAIOSFODNN7EXAMPLE "
+             "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk "
+             "phone +1-415-555-0123")
+    red = redact_text(broad, [])
+    assert "10.0.0.5" not in red
+    assert "192.168.1.8" not in red
+    assert "db.internal.corp" not in red
+    assert "ghp_" not in red
+    assert "AKIAIOSFODNN7EXAMPLE" not in red
+    assert "eyJhbGciOiJIUzI1NiJ9" not in red
+    assert "415-555-0123" not in red
+    assert "text/plain" == redact_text("text/plain", [])
 
 
 # --------------------------------------------------------------------------- HTTP: auth, scope, tiers
@@ -210,6 +228,10 @@ def roster_stack(tmp_path):
 
 def _c(stack, key=API_KEY):
     return httpx.Client(base_url=stack["base"], headers={"Authorization": f"Bearer {key}"}, timeout=20)
+
+
+def flush_roster(stack):
+    stack["app"].state.bridge.roster.recompute()
 
 
 def test_roster_requires_api_key(roster_stack):
@@ -251,6 +273,7 @@ def test_roster_basic_vs_trusted_vs_owner_and_redaction(roster_stack):
                          "metadata": {"roster": {"publicActivity":
                                                  "Running tests at https://github.com/acme/widgets secretproject"}},
                          "eventId": "p-roster"})
+    flush_roster(roster_stack)
 
     with _c(roster_stack, TRUSTED_KEY) as c:
         r = c.get("/roster/coder")
@@ -287,18 +310,25 @@ def test_waiting_on_persisted_from_callback(roster_stack):
                          "metadata": {"roster": {"waitingOn": "owner",
                                                  "publicActivity": "Waiting for review"}},
                          "eventId": "wait-owner"})
+        flush_roster(roster_stack)
         a = c.get("/roster/coder").json()["agents"][0]
         assert a["waitingOn"] == "owner"
         assert a["status"] == "input-required"
         row = roster_stack["app"].state.bridge.store.get_task(tid)
         assert row["waiting_on"] == "owner"
         assert row["public_activity"] == "Waiting for review"
-        # later progress without waitingOn clears it
+        # later progress without waitingOn/publicActivity clears both
         httpx.post(f"{roster_stack['base']}/callback/{tid}",
                    headers={"Authorization": f"Bearer {tok}"},
                    json={"state": "working", "message": "Continuing", "eventId": "cont"})
         row = roster_stack["app"].state.bridge.store.get_task(tid)
         assert row["waiting_on"] is None
+        assert row["public_activity"] is None
+        flush_roster(roster_stack)
+        a = c.get("/roster/coder").json()["agents"][0]
+        assert a["status"] == "busy"
+        assert a.get("waitingOn") is None
+        assert a.get("activity") != "Waiting for review"
 
 
 def test_roster_etag_and_invalid_status(roster_stack):
@@ -308,6 +338,9 @@ def test_roster_etag_and_invalid_status(roster_stack):
         etag = r.headers["etag"]
         r2 = c.get("/roster", headers={"If-None-Match": etag})
         assert r2.status_code == 304
+        assert c.get("/roster", params={"status": "idle"}).status_code == 403
+        assert c.get("/roster", params={"availability": "nope"}).status_code == 400
+    with _c(roster_stack, TRUSTED_KEY) as c:
         bad = c.get("/roster", params={"status": "nope"})
         assert bad.status_code == 400 and bad.json()["param"] == "status"
 
@@ -427,7 +460,9 @@ def test_migration_on_existing_db(tmp_path):
     db.close()
     store = Store(str(path))
     tcols = {r[1] for r in store._x("PRAGMA table_info(tasks)").fetchall()}
-    assert "waiting_on" in tcols and "public_activity" in tcols
+    assert "waiting_on" in tcols and "public_activity" in tcols and "status_text" in tcols
+    idx = {r[1] for r in store._x("PRAGMA index_list(outbox)").fetchall()}
+    assert "ix_outbox_task" in idx and "ix_outbox_kind_status" in idx
     tables = {r[0] for r in store._x("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert "agent_presence" in tables
     pcols = {r[1] for r in store._x("PRAGMA table_info(agent_presence)").fetchall()}
@@ -438,3 +473,281 @@ def test_migration_on_existing_db(tmp_path):
     row = store.get_task("old-1")
     assert row["waiting_on"] == "owner" and row["public_activity"] == "review"
     store.close()
+
+
+# --------------------------------------------------------------------------- review regressions
+def test_basic_status_filter_forbidden_availability_ok(roster_stack):
+    flush_roster(roster_stack)
+    with _c(roster_stack) as c:
+        r = c.get("/roster", params={"status": "idle"})
+        assert r.status_code == 403
+        r = c.get("/roster", params={"availability": "available"})
+        assert r.status_code == 200
+        assert {a["availability"] for a in r.json()["agents"]} <= {"available"}
+        r = c.get("/roster/coder", params={"status": "busy"})
+        assert r.status_code == 403
+    with _c(roster_stack, TRUSTED_KEY) as c:
+        r = c.get("/roster", params={"status": "idle"})
+        assert r.status_code == 200
+        assert all(a["status"] == "idle" for a in r.json()["agents"])
+
+
+def test_owner_tier_intersects_key_agents(roster_stack):
+    flush_roster(roster_stack)
+    with _c(roster_stack, OWNER_SCOPED_KEY) as c:
+        r = c.get("/roster")
+        assert r.status_code == 200
+        names = [a["id"] for a in r.json()["agents"]]
+        assert names == ["other"]
+        assert r.json()["viewTier"] == "owner"
+        assert c.get("/roster/coder").status_code == 404
+        r = c.get("/roster/other", params={"include": "tasks"})
+        assert r.status_code == 200
+        a = r.json()["agents"][0]
+        assert "detail" in a
+        assert all(t.get("taskId") for t in a["detail"].get("tasks", []))
+    with _c(roster_stack, OWNER_KEY) as c:
+        names = [a["id"] for a in c.get("/roster").json()["agents"]]
+        assert "coder" in names and "other" in names
+
+
+def test_owner_wait_uses_input_required_timeout(tmp_path):
+    env = _roster_env(tmp_path, 9, 8)
+    s = load_settings(env)
+    store = Store(s.db_path)
+    bridge = Bridge(s, store, EventBus(), None)
+    _insert_task(store, tid="ow1", state="working", updated_ago=3700, waiting_on="owner")
+    _insert_task(store, tid="w1", state="working", updated_ago=3700, agent="other")
+    n = bridge.sweep()
+    assert store.get_task("ow1")["state"] == "working"
+    assert store.get_task("ow1")["waiting_on"] == "owner"
+    assert store.get_task("w1")["state"] == "failed"
+    assert n >= 1
+    bridge.s.input_required_timeout_s = 3600
+    assert bridge.sweep() >= 1
+    assert store.get_task("ow1")["state"] == "canceled"
+    assert store.get_task("ow1")["waiting_on"] is None
+    store.close()
+
+
+def test_snapshot_serves_cache_without_recompute_or_presence_write(tmp_path):
+    s, store, roster = make_roster(tmp_path)
+    key = next(k for k in s.api_keys if k.label == "main")
+    body, _ = roster.snapshot(key)
+    assert body["agents"] == []
+    roster.recompute()
+    _insert_task(store, tid="w1", state="working", message="Running tests")
+    body, _ = roster.snapshot(key)
+    coder = next(a for a in body["agents"] if a["id"] == "coder")
+    assert coder["availability"] == "available"  # still cached idle
+    rec_calls: list = []
+    orig_re = roster.recompute
+
+    def wrapped_re(*a, **k):
+        rec_calls.append(1)
+        return orig_re(*a, **k)
+
+    roster.recompute = wrapped_re  # type: ignore[method-assign]
+    pres_calls: list = []
+    orig_p = store.presence_update
+
+    def wrapped_p(*a, **k):
+        pres_calls.append(1)
+        return orig_p(*a, **k)
+
+    store.presence_update = wrapped_p  # type: ignore[method-assign]
+    roster.snapshot(key)
+    assert rec_calls == []
+    assert pres_calls == []
+    roster.recompute = orig_re  # type: ignore[method-assign]
+    rec = _status(roster)
+    assert rec["status"] == "busy"
+    assert rec["rawActivity"] == "Running tests"
+    store.close()
+
+
+def test_roster_signals_does_not_load_status_json(tmp_path):
+    _, store, roster = make_roster(tmp_path)
+    _insert_task(store, tid="w1", state="working", message="hi")
+    blob = "A" * 50_000
+    store._x("UPDATE tasks SET status_json=? WHERE id=?",
+             (json.dumps({"state": "working", "file": blob}), "w1"))
+    sig = store.roster_signals(time.time() - 3600)
+    row = sig["active"][0]
+    assert "status_json" not in row
+    assert "status_text" in row
+    rec = _status(roster)
+    assert rec["status"] == "busy"
+    store.close()
+
+
+def test_http_500_does_not_lock_offline(tmp_path):
+    _, store, roster = make_roster(tmp_path)
+    now = time.time()
+    roster.note_delivery_err("coder", "HTTP 500: boom", dead=True, rate_limited=False,
+                             http_status=500, now=now)
+    rec = _status(roster, now=now)
+    assert rec["status"] != "offline"
+    store.close()
+
+
+def test_offline_ttl_expires_auth_lock(tmp_path):
+    s, store, roster = make_roster(tmp_path, A2A_ROSTER_OFFLINE_TTL_S="60")
+    now = time.time()
+    store.presence_update("coder", delivery_dead=1, last_delivery_err_at=now - 120,
+                          last_delivery_err="HTTP 401: denied")
+    rec = _status(roster, now=now)
+    assert rec["status"] == "idle"
+    store.presence_update("coder", delivery_dead=1, last_delivery_err_at=now - 10,
+                          last_delivery_err="HTTP 403")
+    rec = _status(roster, now=now)
+    assert rec["status"] == "offline"
+    store.close()
+
+
+def test_debounce_max_wait_flushes(tmp_path):
+    s, store, roster = make_roster(tmp_path, A2A_ROSTER_DEBOUNCE_S="5",
+                                   A2A_ROSTER_DEBOUNCE_MAX_S="0.15")
+    roster.recompute()
+    _insert_task(store, tid="w1", state="working")
+    roster.touch("coder")
+
+    async def run():
+        t = asyncio.create_task(roster.loop())
+        await asyncio.sleep(0.45)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    rec = roster.last("coder")
+    assert rec is not None and rec["status"] == "busy"
+    store.close()
+
+
+def test_concurrent_migration_tolerates_duplicate_column(tmp_path):
+    path = tmp_path / "race.db"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY, context_id TEXT NOT NULL, agent TEXT NOT NULL,
+          owner TEXT NOT NULL, state TEXT NOT NULL, status_json TEXT NOT NULL,
+          artifacts_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, task_id TEXT,
+          delivery_id TEXT NOT NULL, url TEXT NOT NULL, headers_json TEXT NOT NULL,
+          body TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', last_error TEXT, created_at REAL NOT NULL
+        );
+    """)
+    db.commit()
+    db.close()
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            Store(str(path)).close()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    store = Store(str(path))
+    store._ensure_column("tasks", "waiting_on", "TEXT")
+    tcols = {r[1] for r in store._x("PRAGMA table_info(tasks)").fetchall()}
+    assert "waiting_on" in tcols and "status_text" in tcols
+    store.close()
+
+
+def test_roster_rate_limit_separate_from_rpc(tmp_path):
+    bot_port, bridge_port = free_port(), free_port()
+    from mock_bot import make_app as make_bot
+    from conftest import BOT_TOKEN
+    bot = make_bot(BOT_TOKEN, BOT_SECRET)
+    env = _roster_env(tmp_path, bot_port, bridge_port,
+                      A2A_RATE_LIMIT_PER_MIN="60", A2A_RATE_LIMIT_BURST="3")
+    app = create_app(load_settings(env))
+    with Server(bot, bot_port), Server(app, bridge_port):
+        base = f"http://127.0.0.1:{bridge_port}"
+        with httpx.Client(base_url=base, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=10) as c:
+            codes = [rpc(c, "tasks/get", {"id": "missing"}).status_code for _ in range(6)]
+            assert 429 in codes
+            r = c.get("/roster")
+            assert r.status_code == 200
+
+
+def test_roster_stream_global_and_anon_caps(tmp_path):
+    s, store, roster = make_roster(tmp_path, A2A_ROSTER_MAX_STREAMS="2",
+                                   A2A_ROSTER_MAX_ANON_STREAMS="1",
+                                   A2A_ROSTER_MAX_STREAMS_PER_KEY="3")
+    assert roster.acquire_stream("a")
+    assert roster.acquire_stream("b")
+    assert roster.acquire_stream("c") is False
+    roster.release_stream("a")
+    roster.release_stream("b")
+    assert roster.acquire_stream("*")
+    assert roster.acquire_stream("*") is False
+    roster.release_stream("*")
+    store.close()
+
+
+def test_public_malformed_authorization_is_401(tmp_path):
+    bot_port, bridge_port = free_port(), free_port()
+    from mock_bot import make_app as make_bot
+    from conftest import BOT_TOKEN
+    bot = make_bot(BOT_TOKEN, BOT_SECRET)
+    env = _roster_env(tmp_path, bot_port, bridge_port, A2A_ROSTER_PUBLIC="true")
+    app = create_app(load_settings(env))
+    with Server(bot, bot_port), Server(app, bridge_port):
+        base = f"http://127.0.0.1:{bridge_port}"
+        r = httpx.get(base + "/roster", headers={"Authorization": "Basic abc"})
+        assert r.status_code == 401
+        r = httpx.get(base + "/roster", headers={"Authorization": "Bearer"})
+        assert r.status_code == 401
+        r = httpx.get(base + "/roster")
+        assert r.status_code == 200
+        assert r.json()["viewTier"] == "anonymous"
+        r = httpx.get(base + "/roster", params={"status": "idle"})
+        assert r.status_code == 403
+        r = httpx.get(base + "/roster", params={"availability": "available"})
+        assert r.status_code == 200
+
+
+def test_etag_excludes_status_duration(tmp_path):
+    s, store, roster = make_roster(tmp_path)
+    key = next(k for k in s.api_keys if k.label == "trust")
+    now = time.time()
+    roster.recompute(now=now - 10)
+    body1, etag1 = roster.snapshot(key, now=now - 10)
+    body2, etag2 = roster.snapshot(key, now=now)
+    assert etag1 == etag2
+    d1 = next(a for a in body1["agents"] if a["id"] == "coder")["statusDurationS"]
+    d2 = next(a for a in body2["agents"] if a["id"] == "coder")["statusDurationS"]
+    assert d2 >= d1
+    store.close()
+
+
+def test_parse_api_keys_does_not_echo_secret(tmp_path):
+    with pytest.raises(ConfigError) as ei:
+        parse_api_keys("lab=oops:super-secret-value-abcdefgh")
+    assert "super-secret-value" not in str(ei.value)
+    with pytest.raises(ConfigError) as ei:
+        parse_api_keys("not-an-entry")
+    assert "not-an-entry" not in str(ei.value) or "label=" in str(ei.value)
+
+
+def test_agent_name_stream_is_reserved(tmp_path):
+    env = make_env(tmp_path, 1, 2)
+    data = json.loads(open(env["A2A_AGENTS_CONFIG"]).read())
+    data["agents"][0]["name"] = "stream"
+    open(env["A2A_AGENTS_CONFIG"], "w").write(json.dumps(data))
+    with pytest.raises(ConfigError, match="reserved"):
+        load_settings(env)
