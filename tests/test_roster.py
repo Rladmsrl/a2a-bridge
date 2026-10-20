@@ -28,12 +28,12 @@ def _roster_env(tmp_path, bot_port, bridge_port, **extra):
     keys = (f"main=plain:{API_KEY},lim=plain:{LIMITED_KEY}@other,"
             f"ops=plain:{OWNER_KEY},ops2=plain:{OWNER_SCOPED_KEY}@other,"
             f"trust=plain:{TRUSTED_KEY}")
-    env = make_env(tmp_path, bot_port, bridge_port,
-                   A2A_API_KEYS=keys,
-                   A2A_KEY_TIERS="ops:owner,ops2:owner,trust:trusted",
-                   A2A_ROSTER_DEBOUNCE_S="0.05",
-                   A2A_ROSTER_REDACT="secretproject",
-                   **extra)
+    kwargs = dict(A2A_API_KEYS=keys,
+                  A2A_KEY_TIERS="ops:owner,ops2:owner,trust:trusted",
+                  A2A_ROSTER_DEBOUNCE_S="0.05",
+                  A2A_ROSTER_REDACT="secretproject")
+    kwargs.update(extra)
+    env = make_env(tmp_path, bot_port, bridge_port, **kwargs)
     return env
 
 
