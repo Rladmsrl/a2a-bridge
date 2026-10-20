@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,10 +18,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from . import models as M
-from .config import Settings, load_settings
+from .config import ApiKey, Settings, load_settings
 from .db import Store
 from .events import EventBus
 from .logging_setup import setup_logging
+from .roster import ANON_STREAM_LABEL, ROSTER_BUS_KEY, VALID_AVAILABILITY, VALID_STATUSES, ts_to_iso, view_fp
 from .security import RateLimiter, bearer, callback_token, match_api_key, verify_signature, SIG_HEADER
 from .service import Bridge, Conflict
 
@@ -34,6 +37,26 @@ V1 = {"SendMessage", "SendStreamingMessage", "GetTask", "ListTasks", "CancelTask
       "DeleteTaskPushNotificationConfig", "GetExtendedAgentCard"}
 STREAMING = {"message/stream", "tasks/resubscribe", "SendStreamingMessage", "SubscribeToTask"}
 SUPPORTED_VERSIONS = {"", "0.3", "1.0"}
+
+
+def _card_extensions(s: Settings, name: str, a) -> list[dict]:
+    exts: list[dict] = []
+    if a.required_inputs:
+        exts.append({"uri": "urn:a2a-bridge:input-fields:v1",
+                     "description": "Input fields this agent expects in the first message",
+                     "required": False, "params": {"fields": a.required_inputs}})
+    if a.roster_visible:
+        exts.append({
+            "uri": "urn:a2a-bridge:roster:v1",
+            "required": False,
+            "description": "Live availability of this agent; requires the same API key",
+            "params": {
+                "rosterUrl": f"{s.public_base_url}/roster/{name}",
+                "streamUrl": f"{s.public_base_url}/roster/stream",
+                "statusValues": list(VALID_STATUSES),
+            },
+        })
+    return exts
 
 
 # ---------------------------------------------------------------------------- body size limit (ASGI)
@@ -70,6 +93,41 @@ class BodyLimitMiddleware:
 
 class _TooLarge(Exception):
     pass
+
+
+class _RosterSSE(StreamingResponse):
+    """SSE response that closes the connection when a body write exceeds the timeout."""
+
+    def __init__(self, content, write_timeout: float, on_close):
+        super().__init__(content, media_type="text/event-stream",
+                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                  "Connection": "keep-alive"})
+        self._write_timeout = write_timeout
+        self._on_close = on_close
+
+    async def stream_response(self, send):
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        try:
+            async for chunk in self.body_iterator:
+                if not isinstance(chunk, (bytes, memoryview)):
+                    chunk = chunk.encode(self.charset)
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": chunk, "more_body": True}),
+                    self._write_timeout)
+            await asyncio.wait_for(
+                send({"type": "http.response.body", "body": b"", "more_body": False}),
+                self._write_timeout)
+        except asyncio.TimeoutError:
+            log.warning("roster sse write timeout")
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": b"", "more_body": False}), 1.0)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+            self._on_close()
 
 
 async def _send_413(send):
@@ -119,8 +177,10 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         rid = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
         t0 = time.perf_counter()
         ip = client_ip(req)
-        if req.url.path not in ("/healthz",):
-            ok, retry = limiter.allow(f"ip:{ip}")
+        path = req.url.path
+        if path not in ("/healthz",):
+            bucket = f"ip-roster:{ip}" if path == "/roster" or path.startswith("/roster/") else f"ip:{ip}"
+            ok, retry = limiter.allow(bucket)
             if not ok:
                 return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
                                     headers={"Retry-After": str(int(retry) + 1)})
@@ -160,10 +220,7 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
             "version": a.version,
             "capabilities": {
                 "streaming": True, "pushNotifications": True, "stateTransitionHistory": False,
-                "extensions": ([{"uri": "urn:a2a-bridge:input-fields:v1",
-                                 "description": "Input fields this agent expects in the first message",
-                                 "required": False, "params": {"fields": a.required_inputs}}]
-                               if a.required_inputs else []),
+                "extensions": _card_extensions(s, name, a),
             },
             "securitySchemes": {"bearer": {
                 "type": "http", "scheme": "bearer", "description": "API key issued by the bridge operator",
@@ -212,6 +269,225 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         return JSONResponse({"status": "ok" if ok else "degraded", "db": ok, "version": __version__,
                              "outbox": b.store.outbox_stats(), "streams": b.bus.count()},
                             status_code=200 if ok else 503)
+
+    def roster_unauth():
+        return JSONResponse({"error": "unauthorized"}, status_code=401,
+                            headers={"WWW-Authenticate": 'Bearer realm="a2a-bridge"'})
+
+    def roster_auth(req: Request) -> tuple[ApiKey | None, JSONResponse | None]:
+        # Same precedence as JSON-RPC: a Bearer token if present, otherwise X-API-Key.
+        # A non-bearer Authorization (Basic from a reverse proxy) does not block X-API-Key.
+        auth = req.headers.get("authorization")
+        xkey = (req.headers.get("x-api-key") or "").strip()
+        token = bearer(auth) or xkey or None
+        key = None
+        if token:
+            key = match_api_key(s.api_keys, token)
+            if key is None:
+                log.warning("roster auth failed", extra={"ip": client_ip(req)})
+                return None, roster_unauth()
+        elif s.roster_public and auth is None:
+            key = ApiKey(label=ANON_STREAM_LABEL, sha256="", agents=None, tier="anonymous")
+        else:
+            log.warning("roster auth failed", extra={"ip": client_ip(req)})
+            return None, roster_unauth()
+        ok, retry = limiter.allow(f"roster-key:{key.label}")
+        if not ok:
+            return None, JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                      headers={"Retry-After": str(int(retry) + 1)})
+        return key, None
+
+    def parse_roster_query(req: Request, key: ApiKey) -> tuple[
+            list[str] | None, set[str] | None, set[str] | None, bool, JSONResponse | None]:
+        agents = [x for x in req.query_params.getlist("agent") if x]
+        status_raw = req.query_params.get("status")
+        avail_raw = req.query_params.get("availability")
+        include = req.query_params.get("include")
+        status_filter = None
+        availability_filter = None
+        if status_raw:
+            if key.tier in ("basic", "anonymous"):
+                return None, None, None, False, JSONResponse({"error": "forbidden"}, status_code=403)
+            parts = {p.strip() for p in status_raw.split(",") if p.strip()}
+            if not parts or not parts <= set(VALID_STATUSES):
+                return None, None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "status"}, status_code=400)
+            status_filter = parts
+        if avail_raw:
+            parts = {p.strip() for p in avail_raw.split(",") if p.strip()}
+            if not parts or not parts <= set(VALID_AVAILABILITY):
+                return None, None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "availability"}, status_code=400)
+            availability_filter = parts
+        include_tasks = False
+        if include:
+            if include != "tasks":
+                return None, None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "include"}, status_code=400)
+            include_tasks = True
+        return (agents or None), status_filter, availability_filter, include_tasks, None
+
+    def roster_response(req: Request, body: dict, etag: str):
+        inm = req.headers.get("if-none-match")
+        if inm and etag in {x.strip() for x in inm.split(",")}:
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-store"})
+        return JSONResponse(body, headers={"ETag": etag, "Cache-Control": "no-store"})
+
+    @app.get("/roster")
+    async def roster_list(req: Request):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        assert key is not None
+        agent_filter, status_filter, availability_filter, include_tasks, qerr = parse_roster_query(req, key)
+        if qerr:
+            return qerr
+        if include_tasks and key.tier != "owner":
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        b: Bridge = req.app.state.bridge
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
+        try:
+            body, etag = b.roster.snapshot(key, agent_filter=agent_filter, status_filter=status_filter,
+                                           availability_filter=availability_filter, include_tasks=include_tasks)
+        except sqlite3.Error:
+            return JSONResponse({"error": "degraded"}, status_code=503)
+        return roster_response(req, body, etag)
+
+    @app.get("/roster/stream")
+    async def roster_stream(req: Request):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        assert key is not None
+        b: Bridge = req.app.state.bridge
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
+        label = key.label
+        if not b.roster.acquire_stream(label):
+            return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                headers={"Retry-After": "30"})
+        bus_q = b.bus.subscribe(ROSTER_BUS_KEY)
+        out: asyncio.Queue = asyncio.Queue(maxsize=1)
+        sentinel = object()
+        released = False
+
+        def _release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            b.bus.unsubscribe(ROSTER_BUS_KEY, bus_q)
+            b.roster.release_stream(label)
+
+        async def put(chunk: bytes) -> None:
+            await asyncio.wait_for(out.put(chunk), s.roster_stream_timeout_s)
+
+        async def producer():
+            sub_seq = 0
+            started = time.monotonic()
+            try:
+                await put(b"retry: 3000\n\n")
+                if b.roster.is_stale():
+                    await put(b'event: error\ndata: {"error":"degraded","stale":true}\n\n')
+                    return
+                try:
+                    snap, _ = b.roster.snapshot(key)
+                except sqlite3.Error:
+                    await put(b'event: error\ndata: {"error":"degraded"}\n\n')
+                    return
+                sub_seq += 1
+                await put((f"event: snapshot\nid: {sub_seq}\n"
+                           f"data: {json.dumps(snap, separators=(',', ':'))}\n\n").encode())
+                last = {a["id"]: view_fp(a) for a in snap["agents"]}
+                visible = set(b.roster.visible_names(key))
+                while True:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= s.roster_stream_max_s:
+                        return
+                    wait = min(s.sse_heartbeat_s, max(0.05, s.roster_stream_max_s - elapsed))
+                    try:
+                        ev = await asyncio.wait_for(bus_q.get(), wait)
+                    except asyncio.TimeoutError:
+                        if getattr(bus_q, "dropped", False):
+                            return
+                        if time.monotonic() - started >= s.roster_stream_max_s:
+                            return
+                        await put(b": keepalive\n\n")
+                        continue
+                    agent_id = ev.get("agent")
+                    if not agent_id or agent_id not in visible:
+                        continue
+                    rec = b.roster.last(agent_id)
+                    if rec is None:
+                        continue
+                    projected = b.roster.project(b.roster.with_duration(rec), key)
+                    fp = view_fp(projected)
+                    if last.get(agent_id) == fp:
+                        continue
+                    last[agent_id] = fp
+                    sub_seq += 1
+                    payload = {"seq": sub_seq, "agent": projected}
+                    await put((f"event: update\nid: {sub_seq}\n"
+                               f"data: {json.dumps(payload, separators=(',', ':'))}\n\n").encode())
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                return
+            finally:
+                _release()
+                try:
+                    out.put_nowait(sentinel)
+                except asyncio.QueueFull:
+                    pass
+
+        async def gen():
+            task = asyncio.create_task(producer())
+            try:
+                while True:
+                    if task.done() and out.empty():
+                        break
+                    try:
+                        item = await asyncio.wait_for(out.get(), 0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    if item is sentinel:
+                        break
+                    yield item
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                _release()
+
+        return _RosterSSE(gen(), s.roster_stream_timeout_s, _release)
+
+    @app.get("/roster/{agent}")
+    async def roster_one(req: Request, agent: str):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        assert key is not None
+        _af, status_filter, availability_filter, include_tasks, qerr = parse_roster_query(req, key)
+        if qerr:
+            return qerr
+        if include_tasks and key.tier != "owner":
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        b: Bridge = req.app.state.bridge
+        if agent not in s.agents or agent not in b.roster.visible_names(key):
+            return JSONResponse({"error": "agent not found"}, status_code=404)
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
+        try:
+            body, etag = b.roster.snapshot(key, agent_filter=[agent], status_filter=status_filter,
+                                           availability_filter=availability_filter, include_tasks=include_tasks)
+        except sqlite3.Error:
+            return JSONResponse({"error": "degraded"}, status_code=503)
+        return roster_response(req, body, etag)
 
     # ------------------------------------------------------------------ JSON-RPC
     @app.post("/")

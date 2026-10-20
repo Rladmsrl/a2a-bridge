@@ -83,9 +83,34 @@ Body 字段（至少一个 state/message/artifacts）：
 | `message` | 字符串，或 `{"parts":[…]}`；作为状态消息展示给对方（追问的问题、进度说明、结束说明） |
 | `artifacts` | 结果列表：`{"name":"…","text":"…"}`、`{"name":"…","data":{…}}` 或 `{"name":"…","parts":[…]}`；可选 `artifactId`、`description`、`append:true`（追加到同 artifactId）、`lastChunk` |
 | `eventId` | 每次回调唯一的 id，强烈建议；重试时用相同值即可去重 |
-| `metadata` | 可选对象 |
+| `metadata` | 可选对象。roster 约定见下一小节 |
 
 只发 `message` 不发 `state` = 进度更新（保持 working）。
+
+### 可选：`metadata.roster`（给 `/roster` 用，不影响任务状态）
+
+bridge 会从任务数据**推断** bot 是 idle / busy / stuck / offline，**不会**为了探活去打你的 webhook。你可以额外提供两个提示字段（下次状态/消息进展时 `waitingOn` 和 `publicActivity` 都会被清空，除非这次回调再次带上；进入终态也会清空）：
+
+```json
+{
+  "state": "working",
+  "message": "Waiting for operator approval before opening a PR",
+  "metadata": {
+    "roster": {
+      "waitingOn": "owner",
+      "publicActivity": "Waiting for owner approval"
+    }
+  },
+  "eventId": "wait-owner-1"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `waitingOn` | `owner` \| `requester` \| `auth`。等**运营者审批**时保持 `working`（不要用 `input-required`，调用方无法提供这个输入），并设 `waitingOn: "owner"`。roster 会显示为 input-required、且**不按 stuck 计**。硬超时走 `A2A_INPUT_REQUIRED_TIMEOUT_S`（默认 24h canceled），不是 1 小时 working failed。 |
+| `publicActivity` | ≤120 字符的脱敏摘要，给 trusted 调用方看。不要包含项目名、仓库路径（含 `src/…`）、人名、URL、域名、内网 IP、IPv6、token、JWT、电话（含 `+86` / 11 位手机号）。bridge 仍会再洗一遍，但洗不掉的内容会显示给 trusted。原始 `message` 只给 owner（以及该任务自己的调用方，因为他们本来就能 `tasks/get`）。 |
+
+长任务请定期发 `working` 进度：超过 `A2A_ROSTER_STUCK_AFTER_S`（默认 15 分钟）没有回调会被标为 stuck。普通 working 硬超时仍是 1 小时 failed；`waitingOn=owner` 的任务除外（见上）。
 
 响应：`200 {"ok":true,"task":{…}}`；`401` 认证失败；`400` 参数错误；`409` 任务已是终态（例如已被对方取消）——此时停止工作。网络错误或 5xx 请用相同 `eventId` 退避重试。
 

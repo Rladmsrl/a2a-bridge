@@ -18,6 +18,7 @@ The receiving side can be **any agent or service that can be triggered by an HTT
 - SSE streaming with heartbeats, resubscribe after disconnect, polling fallback, optional push notifications (SSRF-guarded).
 - Auth: inbound bearer API keys (stored as SHA-256, optionally scoped per agent); bot callbacks authenticated with per-task HMAC-derived tokens or HMAC signatures; outbound webhooks carry a bearer token + HMAC signature.
 - Reliability: SQLite persistence, durable outbox with exponential-backoff retries (also handles platforms that report rate limits as HTTP 400), stuck-task timeouts, size limits, rate limiting, JSON logs, `/healthz`.
+- **Roster** (`GET /roster`, `GET /roster/{agent}`, `GET /roster/stream`): live availability inferred from task/delivery data (never by probing bot webhooks), scoped per API key, with optional privacy tiers (`A2A_KEY_TIERS`). Design: [docs/roster-design.md](docs/roster-design.md).
 
 ## 3-step setup
 1. **Create the receiving bot**: e.g. a Grok Bot routine triggered by webhook. Note its webhook URL and sender key. Give the bot the instructions in [docs/BOT-SIDE.md](docs/BOT-SIDE.md) (how to read the payload and reply via callback).
@@ -29,7 +30,7 @@ The receiving side can be **any agent or service that can be triggered by an HTT
    This generates secrets and an API key (`api-key.txt`), writes `.env` + `config/agents.json`, and starts the bridge and Caddy (automatic HTTPS). Check `curl https://a2a.example.com/healthz`.
 3. **Connect clients**: give an external agent the API key and [docs/SKILL.md](docs/SKILL.md) (a generic connect skill; key from env `A2A_KEY`). Full protocol guide: [docs/CONNECT.md](docs/CONNECT.md).
 
-Manual setup, multiple bots, systemd, nginx and all env vars: see [docs/README.zh-CN.md](docs/README.zh-CN.md) and [.env.example](.env.example).
+Manual setup, multiple bots, systemd, nginx and all env vars: see [docs/README.zh-CN.md](docs/README.zh-CN.md) and [.env.example](.env.example). Connecting clients can poll or subscribe to `/roster` before dispatching work (same API key as JSON-RPC).
 
 ## Development
 ```bash

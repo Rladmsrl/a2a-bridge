@@ -172,7 +172,26 @@ if (first.status?.state === "input-required") {
 ```
 也可使用官方 JS SDK `@a2a-js/sdk`，用 Agent Card URL 初始化，并在其 fetch 实现上加 `Authorization` 头。
 
-## 9. 错误码
+## 9. Roster（谁有空）
+
+同一 host、同一 API Key。状态由 bridge 根据任务与投递记录推断，**不会**探测 bot webhook。Agent Card 里只有指针（`urn:a2a-bridge:roster:v1`），没有实时状态。
+
+```bash
+curl -s https://<bridge-host>/roster -H "Authorization: Bearer $A2A_KEY"
+curl -s https://<bridge-host>/roster/<agent> -H "Authorization: Bearer $A2A_KEY"
+curl -N https://<bridge-host>/roster/stream -H "Authorization: Bearer $A2A_KEY"
+```
+
+- 每个 key 只能看到自己被允许调用的 agent（`A2A_API_KEYS` 的 `@agent` 范围始终生效，owner tier 也不例外）；无权或不存在的单条查询一律 404。
+- 查询参数（可选）：`agent=<name>`（可重复）、`availability=available,limited,unavailable`（任何 tier）、`status=idle,busy,input-required,stuck,offline`（仅 trusted/owner；basic/anonymous 用 `status=` 会 403）、`include=tasks`（仅 owner key）。
+- 响应 `Cache-Control: no-store`，带 `ETag`（不含 `generatedAt` / `computedAt` / `statusDurationS`）；`If-None-Match` 可 304。`computedAt` 是全量重算的开始时间（部分重算不刷新它）；缓存过期返回 503 `stale: true`。
+- GET 是只读快照（后台推断缓存）；SSE：首帧 `event: snapshot`，变化时 `event: update`（`seq` 按本连接递增）；`: keepalive` 与任务流相同。每 key 默认最多 3 条 roster 流，全局默认 32，匿名（`A2A_ROSTER_PUBLIC`）另有独立上限 3。写出超时会关掉连接。
+- 认证与 JSON-RPC 一致：`X-API-Key` 在 `Authorization` 不是 Bearer 时仍然有效（例如前面有 Basic 的反向代理）。
+- `GET /roster/stream` 是 SSE；agent 名 `stream` 保留，不能配置。
+- 字段多少取决于 key 的隐私等级（`A2A_KEY_TIERS`，默认 `basic`）：basic 只有粗粒度 `availability`（available / limited / unavailable）；`trusted` 有 status / activity / capacity；`owner` 另有投递错误与（可选）任务列表。详见 [roster-design.md](roster-design.md)。
+- 公开模式下未带任何凭据可看 availability。只有畸形 Authorization、且没有有效的 `X-API-Key` 时才 401（不会降级成匿名）。
+
+## 10. 错误码
 
 | code | 含义 |
 |---|---|
@@ -187,8 +206,8 @@ if (first.status?.state === "input-required") {
 | -32004 | UnsupportedOperation（例如向终态任务发消息；v1 订阅终态任务） |
 | -32005 | ContentTypeNotSupported |
 | -32009 | VersionNotSupported（`A2A-Version` 只接受空、`0.3`、`1.0`） |
-| HTTP 401/403/413/429 | 未认证 / 无权限 / 请求体过大 / 限流 |
+| HTTP 401/403/404/413/429 | 未认证（含畸形 Authorization） / 无权限（如 basic 用 `status=`、`include=tasks`） / roster 中 agent 不存在或不在 key 范围 / 请求体过大 / 限流 |
 
-## 10. 任务状态
+## 11. 任务状态
 
 `submitted`（已收到，排队投递）→ `working`（处理中，可能多次带进度消息）→ `input-required`（需要你回答）/ `completed` / `failed` / `canceled` / `rejected`。超过 1 小时无进展的任务会自动 `failed`；等待输入超过 24 小时会自动 `canceled`（运营方可调整）。

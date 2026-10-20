@@ -17,6 +17,14 @@ Body fields (all optional, but send at least one of state/message/artifacts):
                       | {{"kind":"file","file":{{"name":"a.txt","mimeType":"text/plain","uri":"https://..."}}}}
                (file may use "bytes": "<base64>" instead of "uri"); optional "artifactId", "append": true
   "eventId":   unique id per callback so retries are de-duplicated (recommended)
+  "metadata":  optional object. For the bridge roster, you MAY send
+               metadata.roster.waitingOn = "owner"|"requester"|"auth" and
+               metadata.roster.publicActivity = a <=120 char summary with no
+               secrets, names, repo paths, URLs, IPs, tokens or phone numbers.
+               Stay in "working" when waiting on operator approval (do not use
+               input-required for that); those tasks use the input-required
+               timeout, not the 1 hour working timeout. Restate both fields on
+               every progress callback or they are cleared.
 
 Typical sequence:
 1) Progress (repeat as often as useful):

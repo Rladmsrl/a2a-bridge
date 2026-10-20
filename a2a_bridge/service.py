@@ -15,9 +15,10 @@ import httpx
 
 from . import models as M
 from .config import AgentConfig, Settings
-from .db import Store
+from .db import UNSET, Store
 from .events import EventBus
 from .instructions import bot_instructions
+from .roster import Roster
 from .security import callback_token, check_push_url, sign
 
 log = logging.getLogger("a2a_bridge.service")
@@ -34,6 +35,7 @@ class Bridge:
         self.store = store
         self.bus = bus
         self.http = http_client
+        self.roster = Roster(settings, store, bus)
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
@@ -63,17 +65,27 @@ class Bridge:
         return row
 
     def _set_status(self, row: dict, state: str, message: dict | None = None,
-                    metadata: dict | None = None) -> dict:
+                    metadata: dict | None = None, waiting_on: Any = UNSET,
+                    public_activity: Any = UNSET) -> dict:
         status: dict[str, Any] = {"state": state, "timestamp": M.now_iso()}
         if message:
             status["message"] = message
-        self.store.update_task(row["id"], status=status)
+        if state in M.TERMINAL:
+            if waiting_on is UNSET:
+                waiting_on = None
+            if public_activity is UNSET:
+                public_activity = None
+        self.store.update_task(row["id"], status=status, waiting_on=waiting_on,
+                               public_activity=public_activity)
+        if state in M.TERMINAL:
+            self.store.presence_update(row["agent"], last_terminal_at=time.time())
         ev = {"kind": "status-update", "taskId": row["id"], "contextId": row["context_id"],
               "status": status, "final": state in M.TERMINAL}
         if metadata:
             ev["metadata"] = metadata
         self._emit(row, ev)
         log.info("task state", extra={"task_id": row["id"], "state": state, "agent": row["agent"]})
+        self.roster.touch(row["agent"])
         return status
 
     def _emit(self, row: dict, ev: dict) -> None:
@@ -129,6 +141,7 @@ class Bridge:
             row = self.store.get_task(task_id)
             event = "task.created"
             log.info("task created", extra={"task_id": task_id, "context_id": ctx, "agent": agent, "owner": owner})
+            self.roster.touch(agent)
 
         if push_cfg:
             push_cfg["taskId"] = row["id"]
@@ -252,6 +265,7 @@ class Bridge:
 
     # ------------------------------------------------------------------ bot callback
     def apply_callback(self, row: dict, body: Any) -> tuple[int, dict]:
+        self.roster.note_seen(row["agent"])
         if not isinstance(body, dict):
             raise M.InvalidParams("callback body must be a JSON object")
         event_id = body.get("eventId")
@@ -295,11 +309,18 @@ class Bridge:
                 ev["lastChunk"] = bool(last)
             self._emit(row, ev)
 
-        if state is not None or msg_parts is not None:
+        progress = state is not None or msg_parts is not None
+        wo, pa = _roster_callback_fields(body, progress=progress)
+        if progress:
             new_state = state or (row["state"] if row["state"] != "submitted" else "working")
+            if new_state in M.TERMINAL:
+                wo, pa = None, None
             m = self._agent_message(row, msg_parts) if msg_parts else None
             md = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
-            self._set_status(row, new_state, m, md)
+            self._set_status(row, new_state, m, md, waiting_on=wo, public_activity=pa)
+        elif wo is not UNSET or pa is not UNSET:
+            self.store.update_task(row["id"], waiting_on=wo, public_activity=pa)
+            self.roster.touch(row["agent"])
         return 200, {"ok": True, "task": self.build_task(self.store.get_task(row["id"]))}
 
     def _norm_artifact(self, a: Any) -> tuple[dict, bool, bool | None]:
@@ -321,8 +342,10 @@ class Bridge:
 
     # ------------------------------------------------------------------ background workers
     def start(self) -> None:
+        self.roster.recompute()
         self._tasks = [asyncio.create_task(self._outbox_loop(), name="outbox"),
-                       asyncio.create_task(self._sweeper_loop(), name="sweeper")]
+                       asyncio.create_task(self._sweeper_loop(), name="sweeper"),
+                       asyncio.create_task(self.roster.loop(), name="roster")]
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -363,6 +386,7 @@ class Bridge:
         attempts = r["attempts"] + 1
         err = ""
         permanent = False
+        rate_limited = False
         resp = None
         try:
             resp = await self.http.post(r["url"], content=body, headers=headers, timeout=self.s.webhook_timeout_s)
@@ -371,6 +395,9 @@ class Bridge:
                 log.info("webhook delivered", extra={"kind": r["kind"], "task_id": r["task_id"],
                                                      "attempt": attempts, "status": resp.status_code})
                 if r["kind"] == "bot":
+                    agent = self._agent_of(r["task_id"])
+                    if agent:
+                        self.roster.note_delivery_ok(agent)
                     self._after_bot_delivery(r["task_id"], resp)
                 return
             snippet = resp.text[:300].replace("\n", " ")
@@ -390,11 +417,16 @@ class Bridge:
             log.warning("webhook got 4xx, retrying once more",
                         extra={"kind": r["kind"], "task_id": r["task_id"], "attempt": attempts,
                                "retry_in_s": self.s.webhook_4xx_retry_delay_s, "error": err})
+            self._note_bot_delivery_err(r, err, dead=False, rate_limited=rate_limited,
+                                        retry_in_s=self.s.webhook_4xx_retry_delay_s,
+                                        http_status=resp.status_code if resp is not None else None)
             return
         if permanent or attempts >= self.s.webhook_max_attempts:
             self.store.outbox_dead(r["id"], attempts, err)
             log.error("webhook delivery failed permanently",
                       extra={"kind": r["kind"], "task_id": r["task_id"], "attempt": attempts, "error": err})
+            self._note_bot_delivery_err(r, err, dead=True, rate_limited=rate_limited,
+                                        http_status=resp.status_code if resp is not None else None)
             if r["kind"] == "bot" and r["task_id"]:
                 row = self.store.get_task(r["task_id"])
                 if row and row["state"] not in M.TERMINAL and json.loads(r["body"]).get("event") != "task.canceled":
@@ -410,6 +442,8 @@ class Bridge:
         log.warning("webhook delivery failed, will retry",
                     extra={"kind": r["kind"], "task_id": r["task_id"], "attempt": attempts,
                            "retry_in_s": round(delay, 2), "error": err})
+        self._note_bot_delivery_err(r, err, dead=False, rate_limited=rate_limited, retry_in_s=delay,
+                                    http_status=resp.status_code if resp is not None else None)
 
     def _after_bot_delivery(self, task_id: str, resp: httpx.Response) -> None:
         row = self.store.get_task(task_id)
@@ -430,12 +464,43 @@ class Bridge:
         if row["state"] == "submitted":
             self._set_status(row, "working")
 
+    def _agent_of(self, task_id: str | None) -> str | None:
+        if not task_id:
+            return None
+        row = self.store.get_task(task_id)
+        return row["agent"] if row else None
+
+    def _note_bot_delivery_err(self, r: dict, err: str, *, dead: bool, rate_limited: bool,
+                               retry_in_s: float = 0.0, http_status: int | None = None) -> None:
+        if r.get("kind") != "bot":
+            return
+        agent = self._agent_of(r.get("task_id"))
+        if agent:
+            self.roster.note_delivery_err(agent, err, dead=dead, rate_limited=rate_limited,
+                                          retry_in_s=retry_in_s, http_status=http_status)
+
     async def _sweeper_loop(self) -> None:
         last_purge = 0.0
         while True:
             try:
                 await asyncio.sleep(self.s.sweep_interval_s)
+            except asyncio.CancelledError:
+                raise
+            # Sweep and roster recompute fail independently. A partial roster run must
+            # not be the only thing that advances the cache when the full recompute errors.
+            try:
                 self.sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("sweeper error")
+            try:
+                await self.roster.recompute_async()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("roster recompute error")
+            try:
                 if time.time() - last_purge > 3600 and self.s.retention_days > 0:
                     n = self.store.purge_terminal(time.time() - self.s.retention_days * 86400)
                     last_purge = time.time()
@@ -444,14 +509,23 @@ class Bridge:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("sweeper error")
+                log.exception("purge error")
 
     def sweep(self) -> int:
         now = time.time()
         n = 0
         for row in self.store.stale_tasks(("submitted", "working"), now - self.s.task_timeout_s):
+            if row["state"] == "working" and row.get("waiting_on") == "owner":
+                continue
             self._set_status(row, "failed", self._agent_message(
                 row, [{"kind": "text", "text": f"Task timed out after {self.s.task_timeout_s}s without bot update"}]))
+            self._enqueue_bot(self.store.get_task(row["id"]), "task.canceled", None)
+            n += 1
+        for row in self.store.stale_tasks(("working",), now - self.s.input_required_timeout_s):
+            if row.get("waiting_on") != "owner":
+                continue
+            self._set_status(row, "canceled", self._agent_message(
+                row, [{"kind": "text", "text": "No owner approval received in time; task canceled"}]))
             self._enqueue_bot(self.store.get_task(row["id"]), "task.canceled", None)
             n += 1
         for row in self.store.stale_tasks(("input-required", "auth-required"), now - self.s.input_required_timeout_s):
@@ -467,6 +541,28 @@ class _Conflict(Exception):
 
 
 Conflict = _Conflict
+
+
+def _roster_callback_fields(body: dict, *, progress: bool) -> tuple[Any, Any]:
+    """Persist optional metadata.roster.{waitingOn,publicActivity}.
+
+    On state/message progress (and terminal states via _set_status), both fields
+    clear unless the callback restates them.
+    """
+    md = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+    roster = md.get("roster") if isinstance(md, dict) else None
+    wo: Any = None if progress else UNSET
+    pa: Any = None if progress else UNSET
+    if isinstance(roster, dict):
+        if "waitingOn" in roster:
+            v = roster.get("waitingOn")
+            if v in ("requester", "owner", "auth"):
+                wo = v
+            elif v in (None, ""):
+                wo = None
+        if "publicActivity" in roster:
+            pa = str(roster.get("publicActivity") or "")[:120] or None
+    return wo, pa
 
 
 def b64ok(s: str) -> bool:

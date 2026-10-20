@@ -56,11 +56,15 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+KEY_TIERS = ("basic", "trusted", "owner")
+
+
 @dataclass
 class ApiKey:
     label: str
     sha256: str
     agents: set[str] | None  # None = all agents
+    tier: str = "basic"
 
 
 @dataclass
@@ -80,6 +84,9 @@ class AgentConfig:
     documentation_url: str | None
     webhook_auth_header: str = "Authorization"
     webhook_auth_scheme: str = "Bearer"
+    max_concurrent: int = 1
+    stuck_after_s: int | None = None
+    roster_visible: bool = True
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -112,6 +119,18 @@ class Settings:
     log_level: str = "INFO"
     host: str = "0.0.0.0"
     port: int = 8080
+    roster_stuck_after_s: int = 900
+    roster_offline_after_s: int = 120
+    roster_max_streams_per_key: int = 3
+    roster_max_streams: int = 32
+    roster_max_anon_streams: int = 3
+    roster_stream_timeout_s: float = 30.0
+    roster_stream_max_s: float = 300.0
+    roster_public: bool = False
+    roster_redact: list[str] = field(default_factory=list)
+    roster_debounce_s: float = 1.0
+    roster_debounce_max_s: float = 2.0
+    roster_offline_ttl_s: int = 3600
 
 
 def parse_api_keys(spec: str) -> list[ApiKey]:
@@ -122,8 +141,11 @@ def parse_api_keys(spec: str) -> list[ApiKey]:
     keys: list[ApiKey] = []
     for entry in [e.strip() for e in spec.split(",") if e.strip()]:
         if "=" not in entry:
-            raise ConfigError(f"A2A_API_KEYS entry must be label=sha256:<hex> or label=plain:<key>: {entry[:12]}...")
+            raise ConfigError("A2A_API_KEYS entry must be label=sha256:<hex> or label=plain:<key>")
         label, rest = entry.split("=", 1)
+        label = label.strip()
+        if label == "*":
+            raise ConfigError("API key label '*' is reserved")
         agents = None
         if "@" in rest:
             rest, a = rest.rsplit("@", 1)
@@ -138,8 +160,25 @@ def parse_api_keys(spec: str) -> list[ApiKey]:
             h = sha256_hex(rest[6:])
         else:
             raise ConfigError(f"API key '{label}': value must start with sha256: or plain:")
-        keys.append(ApiKey(label=label.strip(), sha256=h, agents=agents))
+        keys.append(ApiKey(label=label, sha256=h, agents=agents))
     return keys
+
+
+def parse_key_tiers(spec: str) -> dict[str, str]:
+    """A2A_KEY_TIERS: comma separated label:tier entries (basic|trusted|owner).
+    Labels not listed default to basic. Does not change A2A_API_KEYS syntax.
+    """
+    out: dict[str, str] = {}
+    for entry in [e.strip() for e in spec.split(",") if e.strip()]:
+        if ":" not in entry:
+            raise ConfigError("A2A_KEY_TIERS entry must be label:tier")
+        label, tier = entry.split(":", 1)
+        label, tier = label.strip(), tier.strip().lower()
+        if not label or tier not in KEY_TIERS:
+            raise ConfigError(
+                f"A2A_KEY_TIERS: unknown tier {tier!r} for {label!r} (use basic|trusted|owner)")
+        out[label] = tier
+    return out
 
 
 def load_agents(path: str, env: dict) -> dict[str, AgentConfig]:
@@ -155,6 +194,8 @@ def load_agents(path: str, env: dict) -> dict[str, AgentConfig]:
         name = a.get("name", "")
         if not name or not all(c.isalnum() or c in "-_" for c in name):
             raise ConfigError(f"invalid agent name: {name!r} (use [A-Za-z0-9_-])")
+        if name == "stream":
+            raise ConfigError("agent name 'stream' is reserved (GET /roster/stream)")
         tok_env = a.get("webhook_token_env")
         sec_env = a.get("shared_secret_env")
         if not tok_env or not sec_env:
@@ -168,6 +209,28 @@ def load_agents(path: str, env: dict) -> dict[str, AgentConfig]:
         url = env.get(a["webhook_url_env"], "") if a.get("webhook_url_env") else a.get("webhook_url", "")
         if not url.startswith(("http://", "https://")):
             raise ConfigError(f"agent {name}: webhook_url missing/invalid")
+        max_c = a.get("max_concurrent", 1)
+        try:
+            max_c = int(max_c)
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"agent {name}: max_concurrent must be an integer") from e
+        if max_c < 1:
+            raise ConfigError(f"agent {name}: max_concurrent must be >= 1")
+        stuck = a.get("stuck_after_s")
+        if stuck is not None and stuck != "":
+            try:
+                stuck = int(stuck)
+            except (TypeError, ValueError) as e:
+                raise ConfigError(f"agent {name}: stuck_after_s must be an integer") from e
+            if stuck < 1:
+                raise ConfigError(f"agent {name}: stuck_after_s must be >= 1")
+        else:
+            stuck = None
+        vis = a.get("roster_visible", True)
+        if isinstance(vis, str):
+            vis = vis.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            vis = bool(vis)
         agents[name] = AgentConfig(
             name=name,
             display_name=a.get("display_name", name),
@@ -184,6 +247,9 @@ def load_agents(path: str, env: dict) -> dict[str, AgentConfig]:
             documentation_url=a.get("documentation_url"),
             webhook_auth_header=a.get("webhook_auth_header", "Authorization"),
             webhook_auth_scheme=a.get("webhook_auth_scheme", "Bearer"),
+            max_concurrent=max_c,
+            stuck_after_s=stuck,
+            roster_visible=vis,
             raw=a,
         )
     return agents
@@ -199,10 +265,19 @@ def load_settings(env: dict | None = None) -> Settings:
     keys = parse_api_keys(env.get("A2A_API_KEYS", ""))
     if not keys:
         raise ConfigError("A2A_API_KEYS must define at least one inbound API key")
+    tiers = parse_key_tiers(env.get("A2A_KEY_TIERS", ""))
+    for k in keys:
+        k.tier = tiers.get(k.label, "basic")
     agents = load_agents(env.get("A2A_AGENTS_CONFIG", "config/agents.json"), env)
     default = env.get("A2A_DEFAULT_AGENT") or next(iter(agents))
     if default not in agents:
         raise ConfigError(f"A2A_DEFAULT_AGENT={default} not in agents config")
+    task_timeout_s = _int(env, "A2A_TASK_TIMEOUT_S", 3600)
+    for ag in agents.values():
+        if ag.stuck_after_s is not None and ag.stuck_after_s >= task_timeout_s:
+            raise ConfigError(
+                f"agent {ag.name}: stuck_after_s ({ag.stuck_after_s}) must be < A2A_TASK_TIMEOUT_S ({task_timeout_s})")
+    redact = [x.strip() for x in (env.get("A2A_ROSTER_REDACT") or "").split(",") if x.strip()]
     return Settings(
         public_base_url=base,
         db_path=env.get("A2A_DB_PATH", "data/bridge.db"),
@@ -212,7 +287,7 @@ def load_settings(env: dict | None = None) -> Settings:
         max_request_bytes=_int(env, "A2A_MAX_REQUEST_BYTES", 10 * 1024 * 1024),
         rate_limit_per_min=_int(env, "A2A_RATE_LIMIT_PER_MIN", 120),
         rate_limit_burst=_int(env, "A2A_RATE_LIMIT_BURST", 60),
-        task_timeout_s=_int(env, "A2A_TASK_TIMEOUT_S", 3600),
+        task_timeout_s=task_timeout_s,
         input_required_timeout_s=_int(env, "A2A_INPUT_REQUIRED_TIMEOUT_S", 86400),
         retention_days=_int(env, "A2A_RETENTION_DAYS", 30),
         webhook_timeout_s=_float(env, "A2A_WEBHOOK_TIMEOUT_S", 15.0),
@@ -231,4 +306,16 @@ def load_settings(env: dict | None = None) -> Settings:
         log_level=env.get("A2A_LOG_LEVEL", "INFO").upper(),
         host=env.get("A2A_HOST", "0.0.0.0"),
         port=_int(env, "A2A_PORT", 8080),
+        roster_stuck_after_s=_int(env, "A2A_ROSTER_STUCK_AFTER_S", 900),
+        roster_offline_after_s=_int(env, "A2A_ROSTER_OFFLINE_AFTER_S", 120),
+        roster_max_streams_per_key=_int(env, "A2A_ROSTER_MAX_STREAMS_PER_KEY", 3),
+        roster_max_streams=_int(env, "A2A_ROSTER_MAX_STREAMS", 32),
+        roster_max_anon_streams=_int(env, "A2A_ROSTER_MAX_ANON_STREAMS", 3),
+        roster_stream_timeout_s=_float(env, "A2A_ROSTER_STREAM_TIMEOUT_S", 30.0),
+        roster_stream_max_s=_float(env, "A2A_ROSTER_STREAM_MAX_S", 300.0),
+        roster_public=_bool(env, "A2A_ROSTER_PUBLIC", False),
+        roster_redact=redact,
+        roster_debounce_s=_float(env, "A2A_ROSTER_DEBOUNCE_S", 1.0),
+        roster_debounce_max_s=_float(env, "A2A_ROSTER_DEBOUNCE_MAX_S", 2.0),
+        roster_offline_ttl_s=_int(env, "A2A_ROSTER_OFFLINE_TTL_S", 3600),
     )

@@ -14,13 +14,15 @@
 - SSE 流式（心跳注释 `: keepalive`）、断线后 `tasks/resubscribe`、`tasks/get` 轮询兜底、可选推送通知（push notification）。
 - 安全：入站 Bearer API Key（多把，仅存 SHA-256，可限定可访问的 agent）；回调使用**每任务回调令牌**（由每个 bot 的共享密钥 HMAC 派生）或 **HMAC 签名**；出站 webhook 带每个 bot 独立的 Bearer token + HMAC 签名。
 - 运维：SQLite（WAL）持久化、重启不丢任务；webhook 投递走持久化 outbox，指数退避重试；卡死任务超时；请求体大小限制；按 IP / API Key 限流；JSON 结构化日志；`/healthz`。
+- Roster：`GET /roster`、`GET /roster/{agent}`、`GET /roster/stream`（SSE）。状态由任务/投递记录推断，不探测 bot webhook。API Key 范围隔离；`A2A_KEY_TIERS` 控制 basic/trusted/owner 可见字段。
 
 ## 目录
 
 ```
 a2a_bridge/            服务代码
-  app.py               FastAPI 路由：JSON-RPC、Agent Card、回调、健康检查、限流/大小限制
+  app.py               FastAPI 路由：JSON-RPC、Agent Card、回调、健康检查、roster、限流/大小限制
   service.py           任务逻辑、webhook outbox（重试退避）、超时清理、推送通知
+  roster.py            /roster 状态推断与按 key 分级投影（不探测 bot）
   models.py            A2A 数据模型，v0.3 <-> v1.0 转换，错误码
   db.py                SQLite 存储
   security.py          API Key、回调令牌、HMAC 签名、限流、推送 URL 防 SSRF
@@ -36,6 +38,7 @@ scripts/e2e_local.sh   本地端到端演示
 deploy/                systemd unit、Caddyfile、nginx 配置
 docs/CONNECT.md        外部 agent 接入指南
 docs/BOT-SIDE.md       接收端 Grok Bot 的 webhook / callback 协议（可直接作为 skill 文档）
+docs/roster-design.md  `/roster` 设计与实现说明
 tests/                 pytest
 Dockerfile, docker-compose.yml, .env.example
 ```
@@ -63,6 +66,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 | `shared_secret_env` | **环境变量名**，其值（≥32 字符）是 bridge 与该 bot 的共享密钥：派生回调令牌、签名 webhook、校验签名回调 |
 | `skills` | A2A skill 列表（id/name/description/tags/examples/inputModes/outputModes） |
 | `required_inputs` | 期望输入字段（如 repo_url / goal / acceptance_criteria），写入 card 描述、skill 描述和扩展 `urn:a2a-bridge:input-fields:v1`，也随 webhook 发给 bot |
+| `max_concurrent` | 可选，默认 1。roster 用来算满载 / queued |
+| `stuck_after_s` | 可选，覆盖全局 `A2A_ROSTER_STUCK_AFTER_S`，必须小于 `A2A_TASK_TIMEOUT_S` |
+| `roster_visible` | 可选，默认 true。false 时非 owner 的 roster 不展示该 agent，公开 Agent Card 也不带 roster 扩展 |
 | `input_modes` / `output_modes` | 媒体类型 |
 | `webhook_auth_header` / `webhook_auth_scheme` | 出站认证头，默认 `Authorization` + `Bearer`；scheme 设为空串则直接发送 token |
 
@@ -79,7 +85,7 @@ agents.json 不含任何密钥，只引用环境变量名。
 | `A2A_AGENTS_CONFIG` | agents.json 路径（Docker 中为 `/app/config/agents.json`） |
 | 每个 bot 的 `*_WEBHOOK_TOKEN`、`*_SHARED_SECRET`（以及用 `webhook_url_env` 时的 `*_WEBHOOK_URL`） | 名字由 agents.json 决定 |
 
-**可选（默认值）：** `A2A_DEFAULT_AGENT`（第一个）、`A2A_DB_PATH`（data/bridge.db）、`A2A_HOST`(0.0.0.0)、`A2A_PORT`(8080)、`A2A_LOG_LEVEL`(INFO)、`A2A_MAX_REQUEST_BYTES`(10MB)、`A2A_RATE_LIMIT_PER_MIN`(120)、`A2A_RATE_LIMIT_BURST`(60)、`A2A_TASK_TIMEOUT_S`(3600，submitted/working 无更新则 failed)、`A2A_INPUT_REQUIRED_TIMEOUT_S`(86400，等待输入超时则 canceled)、`A2A_RETENTION_DAYS`(30，终态任务清理)、`A2A_WEBHOOK_TIMEOUT_S`(15)、`A2A_WEBHOOK_MAX_ATTEMPTS`(8)、`A2A_WEBHOOK_BACKOFF_BASE_S`(2)、`A2A_WEBHOOK_BACKOFF_MAX_S`(300)、`A2A_WEBHOOK_4XX_RETRIES`(1，401/403/404 以外的 4xx 额外重试次数)、`A2A_WEBHOOK_4XX_RETRY_DELAY_S`(10)、`A2A_SSE_HEARTBEAT_S`(15)、`A2A_BLOCKING_WAIT_S`(30，阻塞式 send 最长等待)、`A2A_CALLBACK_MAX_SKEW_S`(300)、`A2A_PUSH_ALLOW_HTTP`(false)、`A2A_PUSH_ALLOW_PRIVATE`(false)、`A2A_TRUST_PROXY_HEADERS`(true，仅在反向代理后使用)、`A2A_SWEEP_INTERVAL_S`(30)。
+**可选（默认值）：** `A2A_DEFAULT_AGENT`（第一个）、`A2A_DB_PATH`（data/bridge.db）、`A2A_HOST`(0.0.0.0)、`A2A_PORT`(8080)、`A2A_LOG_LEVEL`(INFO)、`A2A_MAX_REQUEST_BYTES`(10MB)、`A2A_RATE_LIMIT_PER_MIN`(120)、`A2A_RATE_LIMIT_BURST`(60)、`A2A_TASK_TIMEOUT_S`(3600，submitted/working 无更新则 failed；`waitingOn=owner` 除外）、`A2A_INPUT_REQUIRED_TIMEOUT_S`(86400，等待输入或 owner 审批超时则 canceled)、`A2A_RETENTION_DAYS`(30，终态任务清理)、`A2A_WEBHOOK_TIMEOUT_S`(15)、`A2A_WEBHOOK_MAX_ATTEMPTS`(8)、`A2A_WEBHOOK_BACKOFF_BASE_S`(2)、`A2A_WEBHOOK_BACKOFF_MAX_S`(300)、`A2A_WEBHOOK_4XX_RETRIES`(1，401/403/404 以外的 4xx 额外重试次数)、`A2A_WEBHOOK_4XX_RETRY_DELAY_S`(10)、`A2A_SSE_HEARTBEAT_S`(15)、`A2A_BLOCKING_WAIT_S`(30，阻塞式 send 最长等待)、`A2A_CALLBACK_MAX_SKEW_S`(300)、`A2A_PUSH_ALLOW_HTTP`(false)、`A2A_PUSH_ALLOW_PRIVATE`(false)、`A2A_TRUST_PROXY_HEADERS`(true，仅在反向代理后使用)、`A2A_SWEEP_INTERVAL_S`(30)、`A2A_KEY_TIERS`（`label:basic\|trusted\|owner`，未列出默认 basic；**不改** `A2A_API_KEYS` 语法；owner 仍受 `@agent` 范围限制）、`A2A_ROSTER_STUCK_AFTER_S`(900)、`A2A_ROSTER_OFFLINE_AFTER_S`(120)、`A2A_ROSTER_OFFLINE_TTL_S`(3600，401/403/404 永久失败导致的 offline 锁过期)、`A2A_ROSTER_MAX_STREAMS_PER_KEY`(3)、`A2A_ROSTER_MAX_STREAMS`(32)、`A2A_ROSTER_MAX_ANON_STREAMS`(3)、`A2A_ROSTER_STREAM_TIMEOUT_S`(30)、`A2A_ROSTER_STREAM_MAX_S`(300)、`A2A_ROSTER_PUBLIC`(false)、`A2A_ROSTER_REDACT`（逗号分隔）、`A2A_ROSTER_DEBOUNCE_S`(1)、`A2A_ROSTER_DEBOUNCE_MAX_S`(2)。agent 名 `stream` 保留给 `GET /roster/stream`。roster 接口见 [CONNECT.md](CONNECT.md) 第 9 节、设计见 [roster-design.md](roster-design.md)。部署前请备份 SQLite。
 
 生成密钥：
 
