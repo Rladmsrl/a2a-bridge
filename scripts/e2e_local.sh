@@ -21,6 +21,28 @@ for i in $(seq 50); do curl -sf http://127.0.0.1:18080/healthz >/dev/null && bre
 export A2A_URL=http://127.0.0.1:18080/agents/coder A2A_KEY="$KEY"
 echo "== healthz";  curl -s http://127.0.0.1:18080/healthz; echo
 echo "== card";     $PY scripts/a2a_cli.py card | head -5
+echo "== roster unauthorized (expect 401)"
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/roster)
+test "$code" = "401"
+echo "== roster"
+curl -sf -H "Authorization: Bearer $A2A_KEY" http://127.0.0.1:18080/roster | $PY -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["viewTier"]=="basic" and d.get("computedAt") and d.get("stale") is False
+a=d["agents"][0]
+assert a["id"]=="coder" and "availability" in a and "status" not in a
+print("roster OK", a["availability"])
+'
+echo "== roster status filter forbidden for basic (expect 403)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $A2A_KEY" "http://127.0.0.1:18080/roster?status=idle")
+test "$code" = "403"
+echo "== card roster extension"
+curl -sf http://127.0.0.1:18080/agents/coder/.well-known/agent-card.json | $PY -c '
+import json,sys
+exts=json.load(sys.stdin)["capabilities"]["extensions"]
+assert any(e.get("uri")=="urn:a2a-bridge:roster:v1" for e in exts)
+print("card roster OK")
+'
 echo "== unauthorized (expect 401)"; curl -s -o /dev/null -w '%{http_code}\n' -X POST "$A2A_URL" -d '{}'
 echo "== stream turn 1 (expect input-required)"
 OUT=$($PY scripts/a2a_cli.py stream "repo_url: https://github.com/x/y goal: demo")

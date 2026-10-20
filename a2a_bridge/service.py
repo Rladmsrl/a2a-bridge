@@ -77,6 +77,8 @@ class Bridge:
                 public_activity = None
         self.store.update_task(row["id"], status=status, waiting_on=waiting_on,
                                public_activity=public_activity)
+        if state in M.TERMINAL:
+            self.store.presence_update(row["agent"], last_terminal_at=time.time())
         ev = {"kind": "status-update", "taskId": row["id"], "contextId": row["context_id"],
               "status": status, "final": state in M.TERMINAL}
         if metadata:
@@ -139,6 +141,7 @@ class Bridge:
             row = self.store.get_task(task_id)
             event = "task.created"
             log.info("task created", extra={"task_id": task_id, "context_id": ctx, "agent": agent, "owner": owner})
+            self.roster.touch(agent)
 
         if push_cfg:
             push_cfg["taskId"] = row["id"]
@@ -482,6 +485,7 @@ class Bridge:
             try:
                 await asyncio.sleep(self.s.sweep_interval_s)
                 self.sweep()
+                await self.roster.recompute_async()
                 if time.time() - last_purge > 3600 and self.s.retention_days > 0:
                     n = self.store.purge_terminal(time.time() - self.s.retention_days * 86400)
                     last_purge = time.time()
@@ -514,10 +518,6 @@ class Bridge:
                 row, [{"kind": "text", "text": "No input received in time; task canceled"}]))
             self._enqueue_bot(self.store.get_task(row["id"]), "task.canceled", None)
             n += 1
-        try:
-            self.roster.tick()
-        except Exception:
-            log.exception("roster tick error")
         return n
 
 

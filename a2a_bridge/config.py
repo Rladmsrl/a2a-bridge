@@ -143,6 +143,9 @@ def parse_api_keys(spec: str) -> list[ApiKey]:
         if "=" not in entry:
             raise ConfigError("A2A_API_KEYS entry must be label=sha256:<hex> or label=plain:<key>")
         label, rest = entry.split("=", 1)
+        label = label.strip()
+        if label == "*":
+            raise ConfigError("API key label '*' is reserved")
         agents = None
         if "@" in rest:
             rest, a = rest.rsplit("@", 1)
@@ -157,7 +160,7 @@ def parse_api_keys(spec: str) -> list[ApiKey]:
             h = sha256_hex(rest[6:])
         else:
             raise ConfigError(f"API key '{label}': value must start with sha256: or plain:")
-        keys.append(ApiKey(label=label.strip(), sha256=h, agents=agents))
+        keys.append(ApiKey(label=label, sha256=h, agents=agents))
     return keys
 
 

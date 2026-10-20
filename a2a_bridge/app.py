@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import sqlite3
@@ -21,7 +22,7 @@ from .config import ApiKey, Settings, load_settings
 from .db import Store
 from .events import EventBus
 from .logging_setup import setup_logging
-from .roster import ANON_STREAM_LABEL, ROSTER_BUS_KEY, VALID_AVAILABILITY, VALID_STATUSES, view_fp
+from .roster import ANON_STREAM_LABEL, ROSTER_BUS_KEY, VALID_AVAILABILITY, VALID_STATUSES, ts_to_iso, view_fp
 from .security import RateLimiter, bearer, callback_token, match_api_key, verify_signature, SIG_HEADER
 from .service import Bridge, Conflict
 
@@ -44,16 +45,17 @@ def _card_extensions(s: Settings, name: str, a) -> list[dict]:
         exts.append({"uri": "urn:a2a-bridge:input-fields:v1",
                      "description": "Input fields this agent expects in the first message",
                      "required": False, "params": {"fields": a.required_inputs}})
-    exts.append({
-        "uri": "urn:a2a-bridge:roster:v1",
-        "required": False,
-        "description": "Live availability of this agent; requires the same API key",
-        "params": {
-            "rosterUrl": f"{s.public_base_url}/roster/{name}",
-            "streamUrl": f"{s.public_base_url}/roster/stream",
-            "statusValues": list(VALID_STATUSES),
-        },
-    })
+    if a.roster_visible:
+        exts.append({
+            "uri": "urn:a2a-bridge:roster:v1",
+            "required": False,
+            "description": "Live availability of this agent; requires the same API key",
+            "params": {
+                "rosterUrl": f"{s.public_base_url}/roster/{name}",
+                "streamUrl": f"{s.public_base_url}/roster/stream",
+                "statusValues": list(VALID_STATUSES),
+            },
+        })
     return exts
 
 
@@ -91,6 +93,41 @@ class BodyLimitMiddleware:
 
 class _TooLarge(Exception):
     pass
+
+
+class _RosterSSE(StreamingResponse):
+    """SSE response that closes the connection when a body write exceeds the timeout."""
+
+    def __init__(self, content, write_timeout: float, on_close):
+        super().__init__(content, media_type="text/event-stream",
+                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                  "Connection": "keep-alive"})
+        self._write_timeout = write_timeout
+        self._on_close = on_close
+
+    async def stream_response(self, send):
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        try:
+            async for chunk in self.body_iterator:
+                if not isinstance(chunk, (bytes, memoryview)):
+                    chunk = chunk.encode(self.charset)
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": chunk, "more_body": True}),
+                    self._write_timeout)
+            await asyncio.wait_for(
+                send({"type": "http.response.body", "body": b"", "more_body": False}),
+                self._write_timeout)
+        except asyncio.TimeoutError:
+            log.warning("roster sse write timeout")
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": b"", "more_body": False}), 1.0)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+            self._on_close()
 
 
 async def _send_413(send):
@@ -238,24 +275,18 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
                             headers={"WWW-Authenticate": 'Bearer realm="a2a-bridge"'})
 
     def roster_auth(req: Request) -> tuple[ApiKey | None, JSONResponse | None]:
+        # Same precedence as JSON-RPC: a Bearer token if present, otherwise X-API-Key.
+        # A non-bearer Authorization (Basic from a reverse proxy) does not block X-API-Key.
         auth = req.headers.get("authorization")
-        xkey = req.headers.get("x-api-key")
+        xkey = (req.headers.get("x-api-key") or "").strip()
+        token = bearer(auth) or xkey or None
         key = None
-        if auth is not None:
-            presented = bearer(auth)
-            if not presented:
-                log.warning("roster auth failed", extra={"ip": client_ip(req)})
-                return None, roster_unauth()
-            key = match_api_key(s.api_keys, presented)
+        if token:
+            key = match_api_key(s.api_keys, token)
             if key is None:
                 log.warning("roster auth failed", extra={"ip": client_ip(req)})
                 return None, roster_unauth()
-        elif xkey:
-            key = match_api_key(s.api_keys, xkey)
-            if key is None:
-                log.warning("roster auth failed", extra={"ip": client_ip(req)})
-                return None, roster_unauth()
-        elif s.roster_public:
+        elif s.roster_public and auth is None:
             key = ApiKey(label=ANON_STREAM_LABEL, sha256="", agents=None, tier="anonymous")
         else:
             log.warning("roster auth failed", extra={"ip": client_ip(req)})
@@ -314,6 +345,9 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         if include_tasks and key.tier != "owner":
             return JSONResponse({"error": "forbidden"}, status_code=403)
         b: Bridge = req.app.state.bridge
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
         try:
             body, etag = b.roster.snapshot(key, agent_filter=agent_filter, status_filter=status_filter,
                                            availability_filter=availability_filter, include_tasks=include_tasks)
@@ -328,6 +362,9 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
             return err
         assert key is not None
         b: Bridge = req.app.state.bridge
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
         label = key.label
         if not b.roster.acquire_stream(label):
             return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
@@ -353,6 +390,9 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
             started = time.monotonic()
             try:
                 await put(b"retry: 3000\n\n")
+                if b.roster.is_stale():
+                    await put(b'event: error\ndata: {"error":"degraded","stale":true}\n\n')
+                    return
                 try:
                     snap, _ = b.roster.snapshot(key)
                 except sqlite3.Error:
@@ -423,9 +463,7 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
                         pass
                 _release()
 
-        return StreamingResponse(gen(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                                          "Connection": "keep-alive"})
+        return _RosterSSE(gen(), s.roster_stream_timeout_s, _release)
 
     @app.get("/roster/{agent}")
     async def roster_one(req: Request, agent: str):
@@ -441,6 +479,9 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         b: Bridge = req.app.state.bridge
         if agent not in s.agents or agent not in b.roster.visible_names(key):
             return JSONResponse({"error": "agent not found"}, status_code=404)
+        if b.roster.is_stale():
+            return JSONResponse({"error": "degraded", "stale": True,
+                                 "computedAt": ts_to_iso(b.roster._computed_at)}, status_code=503)
         try:
             body, etag = b.roster.snapshot(key, agent_filter=[agent], status_filter=status_filter,
                                            availability_filter=availability_filter, include_tasks=include_tasks)

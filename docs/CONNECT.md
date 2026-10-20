@@ -184,11 +184,12 @@ curl -N https://<bridge-host>/roster/stream -H "Authorization: Bearer $A2A_KEY"
 
 - 每个 key 只能看到自己被允许调用的 agent（`A2A_API_KEYS` 的 `@agent` 范围始终生效，owner tier 也不例外）；无权或不存在的单条查询一律 404。
 - 查询参数（可选）：`agent=<name>`（可重复）、`availability=available,limited,unavailable`（任何 tier）、`status=idle,busy,input-required,stuck,offline`（仅 trusted/owner；basic/anonymous 用 `status=` 会 403）、`include=tasks`（仅 owner key）。
-- 响应 `Cache-Control: no-store`，带 `ETag`（不含 `generatedAt` / `statusDurationS`）；`If-None-Match` 可 304。
-- GET 是只读快照（后台推断缓存）；SSE：首帧 `event: snapshot`，变化时 `event: update`（`seq` 按本连接递增）；`: keepalive` 与任务流相同。每 key 默认最多 3 条 roster 流，全局默认 32，匿名（`A2A_ROSTER_PUBLIC`）另有独立上限 3。慢客户端写超时后断开。
+- 响应 `Cache-Control: no-store`，带 `ETag`（不含 `generatedAt` / `computedAt` / `statusDurationS`）；`If-None-Match` 可 304。`computedAt` 是缓存时间；缓存过期返回 503 `stale: true`。
+- GET 是只读快照（后台推断缓存）；SSE：首帧 `event: snapshot`，变化时 `event: update`（`seq` 按本连接递增）；`: keepalive` 与任务流相同。每 key 默认最多 3 条 roster 流，全局默认 32，匿名（`A2A_ROSTER_PUBLIC`）另有独立上限 3。写出超时会关掉连接。
+- 认证与 JSON-RPC 一致：`X-API-Key` 在 `Authorization` 不是 Bearer 时仍然有效（例如前面有 Basic 的反向代理）。
 - `GET /roster/stream` 是 SSE；agent 名 `stream` 保留，不能配置。
 - 字段多少取决于 key 的隐私等级（`A2A_KEY_TIERS`，默认 `basic`）：basic 只有粗粒度 `availability`（available / limited / unavailable）；`trusted` 有 status / activity / capacity；`owner` 另有投递错误与（可选）任务列表。详见 [roster-design.md](roster-design.md)。
-- 公开模式下未带 `Authorization` 可看 availability；带了但格式错误或密钥无效一律 401（不会降级成匿名）。
+- 公开模式下未带任何凭据可看 availability。只有畸形 Authorization、且没有有效的 `X-API-Key` 时才 401（不会降级成匿名）。
 
 ## 10. 错误码
 

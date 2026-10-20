@@ -68,7 +68,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 | `required_inputs` | 期望输入字段（如 repo_url / goal / acceptance_criteria），写入 card 描述、skill 描述和扩展 `urn:a2a-bridge:input-fields:v1`，也随 webhook 发给 bot |
 | `max_concurrent` | 可选，默认 1。roster 用来算满载 / queued |
 | `stuck_after_s` | 可选，覆盖全局 `A2A_ROSTER_STUCK_AFTER_S`，必须小于 `A2A_TASK_TIMEOUT_S` |
-| `roster_visible` | 可选，默认 true。false 时非 owner 的 roster 不展示该 agent |
+| `roster_visible` | 可选，默认 true。false 时非 owner 的 roster 不展示该 agent，公开 Agent Card 也不带 roster 扩展 |
 | `input_modes` / `output_modes` | 媒体类型 |
 | `webhook_auth_header` / `webhook_auth_scheme` | 出站认证头，默认 `Authorization` + `Bearer`；scheme 设为空串则直接发送 token |
 

@@ -94,13 +94,17 @@ CREATE TABLE IF NOT EXISTS agent_presence (
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   throttled_until REAL,
   delivery_dead INTEGER NOT NULL DEFAULT 0,
+  delivery_dead_at REAL,
+  failures_since REAL,
+  last_terminal_at REAL,
   updated_at REAL NOT NULL
 );
 """
 
 _PRESENCE_COLS = {
     "status", "since", "last_seen_at", "last_delivery_ok_at", "last_delivery_err_at",
-    "last_delivery_err", "consecutive_failures", "throttled_until", "delivery_dead", "updated_at",
+    "last_delivery_err", "consecutive_failures", "throttled_until", "delivery_dead",
+    "delivery_dead_at", "failures_since", "last_terminal_at", "updated_at",
 }
 
 
@@ -112,9 +116,9 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         with self._lock:
+            self._db.execute("PRAGMA busy_timeout=5000")
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=NORMAL")
-            self._db.execute("PRAGMA busy_timeout=5000")
             self._db.executescript(SCHEMA)
             self._migrate()
 
@@ -127,9 +131,14 @@ class Store:
             self._ensure_column("tasks", "public_activity", "TEXT")
             self._ensure_column("tasks", "status_text", "TEXT")
             self._ensure_column("agent_presence", "delivery_dead", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("agent_presence", "delivery_dead_at", "REAL")
+            self._ensure_column("agent_presence", "failures_since", "REAL")
+            self._ensure_column("agent_presence", "last_terminal_at", "REAL")
             self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id)")
             self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status)")
             self._db.execute("UPDATE outbox SET status='pending' WHERE status='inflight'")
+            self._backfill_status_text()
+            self._backfill_presence()
             self._db.execute("COMMIT")
         except Exception:
             try:
@@ -149,6 +158,43 @@ class Store:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+
+    def _backfill_status_text(self) -> None:
+        cur = self._db.execute("SELECT id, status_json FROM tasks WHERE status_text IS NULL")
+        while True:
+            batch = cur.fetchmany(200)
+            if not batch:
+                return
+            for tid, raw in batch:
+                try:
+                    status = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(status, dict):
+                    continue
+                text = _text_from_status(status)
+                if text:
+                    self._db.execute("UPDATE tasks SET status_text=? WHERE id=?", (text, tid))
+
+    def _backfill_presence(self) -> None:
+        self._db.execute(
+            "INSERT OR IGNORE INTO agent_presence(agent,status,since,consecutive_failures,delivery_dead,"
+            "updated_at,last_terminal_at) "
+            "SELECT agent,'idle',MAX(updated_at),0,0,MAX(updated_at),MAX(updated_at) FROM tasks "
+            "WHERE state IN ('completed','failed','canceled','rejected') GROUP BY agent")
+        self._db.execute(
+            "UPDATE agent_presence SET last_terminal_at=("
+            "SELECT MAX(updated_at) FROM tasks WHERE tasks.agent=agent_presence.agent "
+            "AND tasks.state IN ('completed','failed','canceled','rejected')) "
+            "WHERE last_terminal_at IS NULL AND EXISTS ("
+            "SELECT 1 FROM tasks WHERE tasks.agent=agent_presence.agent "
+            "AND tasks.state IN ('completed','failed','canceled','rejected'))")
+        self._db.execute(
+            "UPDATE agent_presence SET delivery_dead_at=last_delivery_err_at "
+            "WHERE delivery_dead=1 AND delivery_dead_at IS NULL AND last_delivery_err_at IS NOT NULL")
+        self._db.execute(
+            "UPDATE agent_presence SET failures_since=last_delivery_err_at "
+            "WHERE consecutive_failures>=3 AND failures_since IS NULL AND last_delivery_err_at IS NOT NULL")
 
     def close(self) -> None:
         with self._lock:
@@ -321,6 +367,10 @@ class Store:
         self._x("DELETE FROM callback_events WHERE task_id=? AND event_id=?", (task_id, event_id))
 
     # ------------------------------------------------------------ roster / presence
+    def presence_get(self, agent: str) -> dict | None:
+        r = self._x("SELECT * FROM agent_presence WHERE agent=?", (agent,)).fetchone()
+        return dict(r) if r else None
+
     def presence_ensure(self, agent: str, now: float | None = None) -> None:
         t = time.time() if now is None else now
         self._x("INSERT OR IGNORE INTO agent_presence(agent,status,since,consecutive_failures,"
@@ -337,6 +387,8 @@ class Store:
             args.append(v)
         if increment_failures:
             sets.append("consecutive_failures=consecutive_failures+1")
+            sets.append("failures_since=COALESCE(failures_since, ?)")
+            args.append(now)
         if not sets:
             return
         sets.append("updated_at=?")
@@ -352,15 +404,14 @@ class Store:
         failed = {r[0]: r[1] for r in self._x(
             "SELECT agent, COUNT(*) FROM tasks WHERE state='failed' AND updated_at>=? GROUP BY agent",
             (hour_ago,)).fetchall()}
-        last_term = {r[0]: r[1] for r in self._x(
-            "SELECT agent, MAX(updated_at) FROM tasks WHERE state IN "
-            "('completed','failed','canceled','rejected') GROUP BY agent").fetchall()}
+        presence = {r["agent"]: dict(r) for r in self._x("SELECT * FROM agent_presence").fetchall()}
+        last_term = {a: p["last_terminal_at"] for a, p in presence.items()
+                     if p.get("last_terminal_at") is not None}
         pending = {r[0]: r[1] for r in self._x(
             "SELECT t.agent, COUNT(*) FROM outbox o JOIN tasks t ON t.id=o.task_id "
             "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent").fetchall()}
         delivered_sub = {r[0] for r in self._x(
-            "SELECT t.id FROM tasks t JOIN outbox o ON o.task_id=t.id "
-            "AND o.kind='bot' AND o.status='done' WHERE t.state='submitted'").fetchall()}
-        presence = {r["agent"]: dict(r) for r in self._x("SELECT * FROM agent_presence").fetchall()}
+            "SELECT t.id FROM tasks t WHERE t.state='submitted' AND EXISTS ("
+            "SELECT 1 FROM outbox o WHERE o.task_id=t.id AND o.kind='bot' AND o.status='done')").fetchall()}
         return {"active": active, "failed_hour": failed, "last_terminal": last_term,
                 "outbox_pending": pending, "delivered_submitted": delivered_sub, "presence": presence}

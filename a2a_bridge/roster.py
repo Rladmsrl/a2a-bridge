@@ -40,21 +40,25 @@ _UUID_RE = re.compile(
 _HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
 _REPO_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]+/[A-Za-z0-9._-]+\b")
 _MIME_LEFT = {"text", "application", "image", "audio", "video", "multipart", "font", "model"}
+# Generic slash pairs that are not org/repo (unit/integration, text/plain, …).
+_REPO_SKIP = {
+    "unit", "integration", "test", "tests", "src", "lib", "app", "and", "or",
+    "read", "write", "input", "output", "text", "plain", "socket", "asp",
+    "main", "master", "dev", "bin", "docs", "doc",
+}
 _IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
-_IPV6_RE = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
+# Compressed forms (::1, fe80::1) as well as fully written addresses.
+_IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?![\w:])")
 _INTERNAL_HOST_RE = re.compile(
     r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:local|internal|lan|corp|home|intranet)\b",
-    re.I)
-_DNS_HOST_RE = re.compile(
-    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
-    r"(?:com|net|org|edu|io|ai|app|dev|cloud|co|info|gov|biz)\b",
     re.I)
 _GITHUB_TOKEN_RE = re.compile(
     r"\b(?:gh[pours]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 _AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+# NANP-like numbers only, so dates (2026-10-20) and counts (120 200 300) stay.
 _PHONE_RE = re.compile(
-    r"(?<!\w)(?:\+\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?){2}\d{2,4}(?!\w)")
+    r"(?<!\w)(?:\+\d{1,3}[\s.-])?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\w)")
 
 
 def ts_to_iso(ts: float | None) -> str | None:
@@ -85,9 +89,10 @@ def etag_of(obj: Any) -> str:
 
 
 def etag_of_roster(body: dict) -> str:
-    """ETag ignores generatedAt (request time) and statusDurationS (ticks every second)."""
+    """ETag ignores request time, cache time, and fields that tick without a real change."""
+    skip = {"generatedAt", "computedAt", "stale", "agents"}
     agents = [{k: v for k, v in a.items() if k != "statusDurationS"} for a in body.get("agents", [])]
-    payload = {k: v for k, v in body.items() if k not in ("generatedAt", "agents")}
+    payload = {k: v for k, v in body.items() if k not in skip}
     payload["agents"] = agents
     return etag_of(payload)
 
@@ -125,12 +130,11 @@ def redact_text(text: str, extra: list[re.Pattern]) -> str:
     s = _IPV4_RE.sub(_redact_ip, s)
     s = _IPV6_RE.sub(_redact_ip, s)
     s = _INTERNAL_HOST_RE.sub("[redacted]", s)
-    s = _DNS_HOST_RE.sub("[redacted]", s)
     s = _PHONE_RE.sub("[redacted]", s)
 
     def _repo(m: re.Match) -> str:
-        left = m.group(0).split("/", 1)[0]
-        if left.lower() in _MIME_LEFT:
+        left, right = m.group(0).split("/", 1)
+        if left.lower() in _MIME_LEFT or left.lower() in _REPO_SKIP or right.lower() in _REPO_SKIP:
             return m.group(0)
         return "[redacted]"
 
@@ -189,6 +193,7 @@ class Roster:
         self._dirty_since = 0.0
         self._streams: dict[str, int] = {}
         self._stream_lock = threading.Lock()
+        self._computed_at: float | None = None
         self._redact = compile_redact(settings.roster_redact)
 
     # ------------------------------------------------------------------ liveness evidence (never probes)
@@ -200,17 +205,24 @@ class Roster:
     def note_delivery_ok(self, agent: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         self.store.presence_update(agent, last_seen_at=now, last_delivery_ok_at=now,
-                                   consecutive_failures=0, delivery_dead=0, throttled_until=None)
+                                   consecutive_failures=0, failures_since=None,
+                                   delivery_dead=0, delivery_dead_at=None, throttled_until=None)
         self.touch(agent)
 
     def note_delivery_err(self, agent: str, err: str, *, dead: bool, rate_limited: bool,
                           retry_in_s: float = 0.0, now: float | None = None,
                           http_status: int | None = None) -> None:
         now = time.time() if now is None else now
-        fields: dict[str, Any] = {"last_delivery_err_at": now, "last_delivery_err": (err or "")[:200]}
-        # Only auth-shaped permanent failures lock the agent offline (with TTL).
+        prev = self.store.presence_get(agent)
+        prev_err = prev.get("last_delivery_err_at") if prev else None
+        if prev_err is not None and (now - float(prev_err)) > max(1, self.s.roster_offline_ttl_s):
+            self.store.presence_update(agent, consecutive_failures=0, failures_since=None, updated_at=now)
+        fields: dict[str, Any] = {"last_delivery_err_at": now, "last_delivery_err": (err or "")[:200],
+                                  "updated_at": now}
+        # Auth failures record their own timestamp. Other errors must not refresh it.
         if dead and http_status in AUTH_DEAD_STATUSES:
             fields["delivery_dead"] = 1
+            fields["delivery_dead_at"] = now
         if rate_limited:
             fields["throttled_until"] = now + max(float(retry_in_s), 1.0)
         self.store.presence_update(agent, increment_failures=True, **fields)
@@ -225,6 +237,15 @@ class Roster:
 
     def tick(self) -> None:
         self.recompute()
+
+    def cache_limit_s(self) -> float:
+        return max(float(self.s.sweep_interval_s), 1.0) * 3
+
+    def is_stale(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        if self._computed_at is None:
+            return True
+        return (now - self._computed_at) > self.cache_limit_s()
 
     def last(self, name: str) -> dict | None:
         return self._last.get(name)
@@ -274,7 +295,11 @@ class Roster:
                     continue
                 names = self._dirty.copy()
                 self._dirty.clear()
-                self.recompute(names)
+                try:
+                    await self.recompute_async(names)
+                except Exception:
+                    self._dirty.update(names)
+                    raise
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -292,24 +317,76 @@ class Roster:
 
     # ------------------------------------------------------------------ infer + persist
     def recompute(self, names: Iterable[str] | None = None, now: float | None = None) -> dict[str, dict]:
+        """Synchronous recompute. Publishes on this thread; use from tests and startup."""
         now = time.time() if now is None else now
+        recs, changed = self._compute(names, dict(self._last), now)
+        self._apply(recs, changed, now, publish=True)
+        return recs
+
+    async def recompute_async(self, names: Iterable[str] | None = None) -> dict[str, dict]:
+        """DB work off the event loop; EventBus publish stays on the loop."""
+        now = time.time()
+        prev = dict(self._last)
+        recs, changed = await asyncio.to_thread(self._compute, names, prev, now)
+        self._apply(recs, changed, now, publish=True)
+        return recs
+
+    def _apply(self, recs: dict[str, dict], changed: list[str], now: float, *, publish: bool) -> None:
+        self._last.update(recs)
+        self._computed_at = now
+        if not publish:
+            return
+        for name in changed:
+            self.seq += 1
+            self.bus.publish(ROSTER_BUS_KEY, {"agent": name})
+
+    def _compute(self, names: Iterable[str] | None, prev: dict[str, dict],
+                 now: float) -> tuple[dict[str, dict], list[str]]:
         sig = self.store.roster_signals(now - 3600)
         targets = list(self.s.agents) if names is None else [n for n in names if n in self.s.agents]
-        out: dict[str, dict] = dict(self._last)
+        out: dict[str, dict] = {}
+        changed: list[str] = []
         for name in targets:
-            rec = self._infer(name, now, sig)
-            prev = self._last.get(name)
-            changed = prev is None or _fp(prev) != _fp(rec)
-            if prev is None or prev.get("status") != rec["status"] or prev.get("since") != rec["since"]:
+            presence = self._expire_auth_lock(name, sig["presence"].get(name) or {}, now)
+            presence = self._expire_failure_streak(name, presence, now)
+            sig["presence"][name] = presence
+            old = prev.get(name)
+            rec = self._infer(name, now, sig, old)
+            if old is None or old.get("status") != rec["status"] or old.get("since") != rec["since"]:
                 self.store.presence_update(name, status=rec["status"], since=rec["since"])
-            if rec["status"] in ("stuck", "offline") and (prev or {}).get("status") != rec["status"]:
+            if rec["status"] in ("stuck", "offline") and (old or {}).get("status") != rec["status"]:
                 log.warning("roster %s", rec["status"], extra={"agent": name})
             out[name] = rec
-            self._last[name] = rec
-            if changed:
-                self.seq += 1
-                self.bus.publish(ROSTER_BUS_KEY, {"agent": name})
-        return {n: out[n] for n in targets if n in out} if names is not None else out
+            if old is None or _fp(old) != _fp(rec):
+                changed.append(name)
+        return out, changed
+
+    def _expire_auth_lock(self, name: str, presence: dict, now: float) -> dict:
+        """Drop delivery_dead once its own timestamp (not the latest error) is past TTL."""
+        if not presence.get("delivery_dead"):
+            return presence
+        dead_at = presence.get("delivery_dead_at")
+        ttl = max(1, self.s.roster_offline_ttl_s)
+        if dead_at is not None and (now - float(dead_at)) <= ttl:
+            return presence
+        self.store.presence_update(name, delivery_dead=0, delivery_dead_at=None)
+        presence = dict(presence)
+        presence["delivery_dead"] = 0
+        presence["delivery_dead_at"] = None
+        return presence
+
+    def _expire_failure_streak(self, name: str, presence: dict, now: float) -> dict:
+        """A quiet stretch longer than the offline TTL ends the failure streak."""
+        last_err = presence.get("last_delivery_err_at")
+        if not presence.get("consecutive_failures") or last_err is None:
+            return presence
+        if (now - float(last_err)) <= max(1, self.s.roster_offline_ttl_s):
+            return presence
+        self.store.presence_update(name, consecutive_failures=0, failures_since=None)
+        presence = dict(presence)
+        presence["consecutive_failures"] = 0
+        presence["failures_since"] = None
+        return presence
 
     def snapshot(self, key: ApiKey, *, agent_filter: list[str] | None = None,
                  status_filter: set[str] | None = None, availability_filter: set[str] | None = None,
@@ -331,8 +408,11 @@ class Roster:
             if availability_filter and live["availability"] not in availability_filter:
                 continue
             agents.append(self.project(live, key, include_tasks=include_tasks))
+        stale = self.is_stale(now)
         body = {
             "generatedAt": ts_to_iso(now),
+            "computedAt": ts_to_iso(self._computed_at),
+            "stale": stale,
             "viewTier": key.tier,
             "ttlSeconds": TTL_SECONDS,
             "stream": f"{self.s.public_base_url}/roster/stream",
@@ -340,7 +420,7 @@ class Roster:
         }
         return body, etag_of_roster(body)
 
-    def _infer(self, name: str, now: float, sig: dict) -> dict:
+    def _infer(self, name: str, now: float, sig: dict, prev: dict | None = None) -> dict:
         agent = self.s.agents[name]
         tasks = [t for t in sig["active"] if t["agent"] == name]
         presence = sig["presence"].get(name) or {}
@@ -361,13 +441,19 @@ class Roster:
         throttled = bool(throttled_until and throttled_until > now)
         consec = int(presence.get("consecutive_failures") or 0)
         dead = bool(presence.get("delivery_dead"))
+        dead_at = presence.get("delivery_dead_at")
         ttl = max(1, self.s.roster_offline_ttl_s)
-        auth_lock = dead and last_err is not None and (now - float(last_err)) <= ttl
+        failures_since = presence.get("failures_since")
+        auth_lock = bool(dead and dead_at is not None and (now - float(dead_at)) <= ttl
+                         and (last_seen is None or float(last_seen) <= float(dead_at)))
+        err_fresh = last_err is None or (now - float(last_err)) <= ttl
+        streak_aged = failures_since is not None and (now - float(failures_since)) >= self.s.roster_offline_after_s
+        sub_aged = oldest_sub is not None and (now - oldest_sub) >= self.s.roster_offline_after_s
+        seen_after_err = last_seen is not None and last_err is not None and float(last_seen) > float(last_err)
+        fail_lock = consec >= 3 and err_fresh and (streak_aged or sub_aged) and not seen_after_err
 
         status = "idle"
-        if auth_lock and (last_seen is None or last_err is None or last_seen <= last_err):
-            status = "offline"
-        elif consec >= 3 and oldest_sub is not None and (now - oldest_sub) >= self.s.roster_offline_after_s:
+        if auth_lock or fail_lock:
             status = "offline"
         else:
             stale = [t for t in working_real if now - t["updated_at"] > stuck_after]
@@ -427,7 +513,6 @@ class Roster:
             if txt:
                 own_activity[t["owner"]] = txt
 
-        prev = self._last.get(name)
         since = self._since(status, prev, presence, now, tasks, sig["last_terminal"].get(name))
         counts = {k: len(by[k]) for k in ("submitted", "working", "input-required", "auth-required")}
         task_rows = []
@@ -505,7 +590,10 @@ class Roster:
             if cand:
                 return min(_row_ts(t) for t in cand)
         if status == "offline":
-            return float(presence["last_delivery_err_at"]) if presence.get("last_delivery_err_at") else now
+            for key in ("delivery_dead_at", "failures_since", "last_delivery_err_at"):
+                if presence.get(key) is not None:
+                    return float(presence[key])
+            return now
         if status == "idle":
             return float(last_terminal) if last_terminal else now
         return now
