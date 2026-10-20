@@ -52,13 +52,24 @@ _IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?![
 _INTERNAL_HOST_RE = re.compile(
     r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:local|internal|lan|corp|home|intranet)\b",
     re.I)
+# Ordinary DNS names. Two well-known non-host tokens are put back by _redact_host.
+_PUBLIC_HOST_RE = re.compile(
+    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:com|net|org|edu|gov|io|ai|app|dev|cloud|co)\b",
+    re.I)
+_HOST_SKIP = {"asp.net", "socket.io"}
 _GITHUB_TOKEN_RE = re.compile(
     r"\b(?:gh[pours]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 _AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-# NANP-like numbers only, so dates (2026-10-20) and counts (120 200 300) stay.
+# NANP, +86, and 11-digit mobiles (138…). Dates (2026-10-20) and counts (120 200 300) stay.
 _PHONE_RE = re.compile(
-    r"(?<!\w)(?:\+\d{1,3}[\s.-])?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\w)")
+    r"(?<!\w)(?:"
+    r"\+86[\s.-]?1[3-9](?:[\s.-]?\d){9}"
+    r"|(?:\+\d{1,3}[\s.-])?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}"
+    r"|1[3-9](?:[\s.-]?\d){9}"
+    r")(?!\w)")
+# Host and email patterns backtrack on long input. Cap before they run; output is 120.
+_REDACT_INPUT_MAX = 512
 
 
 def ts_to_iso(ts: float | None) -> str | None:
@@ -112,14 +123,25 @@ def _redact_ip(m: re.Match) -> str:
         ip = ipaddress.ip_address(m.group(0))
     except ValueError:
         return m.group(0)
+    # Every IPv6 address is sensitive enough for a roster line (public ones included).
+    if isinstance(ip, ipaddress.IPv6Address):
+        return "[redacted]"
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
         return "[redacted]"
     return m.group(0)
 
 
+def _redact_host(m: re.Match) -> str:
+    if m.group(0).lower() in _HOST_SKIP:
+        return m.group(0)
+    return "[redacted]"
+
+
 def redact_text(text: str, extra: list[re.Pattern]) -> str:
     if not text:
         return text
+    if len(text) > _REDACT_INPUT_MAX:
+        text = text[:_REDACT_INPUT_MAX]
     s = _URL_RE.sub("[redacted]", text)
     s = _EMAIL_RE.sub("[redacted]", s)
     s = _JWT_RE.sub("[redacted]", s)
@@ -130,11 +152,16 @@ def redact_text(text: str, extra: list[re.Pattern]) -> str:
     s = _IPV4_RE.sub(_redact_ip, s)
     s = _IPV6_RE.sub(_redact_ip, s)
     s = _INTERNAL_HOST_RE.sub("[redacted]", s)
+    s = _PUBLIC_HOST_RE.sub(_redact_host, s)
     s = _PHONE_RE.sub("[redacted]", s)
 
     def _repo(m: re.Match) -> str:
         left, right = m.group(0).split("/", 1)
-        if left.lower() in _MIME_LEFT or left.lower() in _REPO_SKIP or right.lower() in _REPO_SKIP:
+        ll, rl = left.lower(), right.lower()
+        if ll in _MIME_LEFT:
+            return m.group(0)
+        # Both sides have to be generic. src/secret-billing is still a path.
+        if ll in _REPO_SKIP and rl in _REPO_SKIP:
             return m.group(0)
         return "[redacted]"
 
@@ -194,6 +221,7 @@ class Roster:
         self._streams: dict[str, int] = {}
         self._stream_lock = threading.Lock()
         self._computed_at: float | None = None
+        self._recompute_lock = asyncio.Lock()
         self._redact = compile_redact(settings.roster_redact)
 
     # ------------------------------------------------------------------ liveness evidence (never probes)
@@ -213,6 +241,12 @@ class Roster:
                           retry_in_s: float = 0.0, now: float | None = None,
                           http_status: int | None = None) -> None:
         now = time.time() if now is None else now
+        # A 429 (or a body that says rate limit) only pauses delivery. It is not a failure streak.
+        if rate_limited:
+            self.store.presence_update(agent, throttled_until=now + max(float(retry_in_s), 1.0),
+                                       updated_at=now)
+            self.touch(agent)
+            return
         prev = self.store.presence_get(agent)
         prev_err = prev.get("last_delivery_err_at") if prev else None
         if prev_err is not None and (now - float(prev_err)) > max(1, self.s.roster_offline_ttl_s):
@@ -223,8 +257,6 @@ class Roster:
         if dead and http_status in AUTH_DEAD_STATUSES:
             fields["delivery_dead"] = 1
             fields["delivery_dead_at"] = now
-        if rate_limited:
-            fields["throttled_until"] = now + max(float(retry_in_s), 1.0)
         self.store.presence_update(agent, increment_failures=True, **fields)
         self.touch(agent)
 
@@ -293,13 +325,7 @@ class Roster:
                 age = nowm - self._dirty_since
                 if quiet < self.s.roster_debounce_s and age < self.s.roster_debounce_max_s:
                     continue
-                names = self._dirty.copy()
-                self._dirty.clear()
-                try:
-                    await self.recompute_async(names)
-                except Exception:
-                    self._dirty.update(names)
-                    raise
+                await self.recompute_async(set(self._dirty))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -320,25 +346,54 @@ class Roster:
         """Synchronous recompute. Publishes on this thread; use from tests and startup."""
         now = time.time() if now is None else now
         recs, changed = self._compute(names, dict(self._last), now)
-        self._apply(recs, changed, now, publish=True)
+        self._apply(recs, changed, now, publish=True, full=names is None)
         return recs
 
     async def recompute_async(self, names: Iterable[str] | None = None) -> dict[str, dict]:
-        """DB work off the event loop; EventBus publish stays on the loop."""
-        now = time.time()
-        prev = dict(self._last)
-        recs, changed = await asyncio.to_thread(self._compute, names, prev, now)
-        self._apply(recs, changed, now, publish=True)
-        return recs
+        """One recompute at a time. DB work is off the event loop; publish stays on it.
 
-    def _apply(self, recs: dict[str, dict], changed: list[str], now: float, *, publish: bool) -> None:
+        Agents marked dirty while this run holds the lock are left for the next run.
+        A result that started before the cache's current computation is dropped.
+        """
+        async with self._recompute_lock:
+            if names is None:
+                targets: set[str] | None = None
+                pending = set(self._dirty)
+                self._dirty.clear()
+            else:
+                targets = set(names) | set(self._dirty)
+                pending = set(targets)
+                self._dirty.difference_update(targets)
+            started = time.time()
+            prev = dict(self._last)
+            try:
+                recs, changed = await asyncio.to_thread(
+                    self._compute, None if targets is None else list(targets), prev, started)
+            except Exception:
+                self._dirty.update(pending)
+                raise
+            if not self._apply(recs, changed, started, publish=True, full=targets is None):
+                self._dirty.update(pending)
+            return recs
+
+    def _apply(self, recs: dict[str, dict], changed: list[str], started: float, *,
+               publish: bool, full: bool) -> bool:
+        """Install `recs` when this run started after the cache was last fully computed.
+
+        `_computed_at` moves only on a full recompute, so a partial run cannot hide a
+        failing full recompute from the stale-cache check.
+        """
+        if self._computed_at is not None and started < self._computed_at:
+            return False
         self._last.update(recs)
-        self._computed_at = now
+        if full:
+            self._computed_at = started
         if not publish:
-            return
+            return True
         for name in changed:
             self.seq += 1
             self.bus.publish(ROSTER_BUS_KEY, {"agent": name})
+        return True
 
     def _compute(self, names: Iterable[str] | None, prev: dict[str, dict],
                  now: float) -> tuple[dict[str, dict], list[str]]:
@@ -369,7 +424,8 @@ class Roster:
         ttl = max(1, self.s.roster_offline_ttl_s)
         if dead_at is not None and (now - float(dead_at)) <= ttl:
             return presence
-        self.store.presence_update(name, delivery_dead=0, delivery_dead_at=None)
+        if not self.store.presence_clear_auth_lock(name, dead_at):
+            return self.store.presence_get(name) or presence
         presence = dict(presence)
         presence["delivery_dead"] = 0
         presence["delivery_dead_at"] = None
@@ -378,11 +434,13 @@ class Roster:
     def _expire_failure_streak(self, name: str, presence: dict, now: float) -> dict:
         """A quiet stretch longer than the offline TTL ends the failure streak."""
         last_err = presence.get("last_delivery_err_at")
-        if not presence.get("consecutive_failures") or last_err is None:
+        consec = presence.get("consecutive_failures")
+        if not consec or last_err is None:
             return presence
         if (now - float(last_err)) <= max(1, self.s.roster_offline_ttl_s):
             return presence
-        self.store.presence_update(name, consecutive_failures=0, failures_since=None)
+        if not self.store.presence_clear_failure_streak(name, int(consec), last_err):
+            return self.store.presence_get(name) or presence
         presence = dict(presence)
         presence["consecutive_failures"] = 0
         presence["failures_since"] = None

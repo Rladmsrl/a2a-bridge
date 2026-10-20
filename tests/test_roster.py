@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 
 from a2a_bridge.app import create_app
 from a2a_bridge.config import ConfigError, load_settings, parse_api_keys
-from a2a_bridge.db import Store
+from a2a_bridge.db import SQL_DELIVERED_SUBMITTED, SQL_OUTBOX_PENDING, Store
 from a2a_bridge.events import EventBus
 from a2a_bridge.roster import Roster, redact_text, ts_to_iso
 from a2a_bridge.security import callback_token
@@ -106,7 +108,8 @@ def test_stuck_working_past_threshold(tmp_path):
     rec = _status(roster, now=now)
     assert rec["status"] == "stuck"
     assert rec["availability"] == "unavailable"
-    rec_fresh = _status(roster, now=now - 200)  # age ~800s < 900
+    store._x("UPDATE tasks SET updated_at=? WHERE id=?", (now - 800, "s1"))
+    rec_fresh = _status(roster, now=now + 1)  # age ~801s < 900
     assert rec_fresh["status"] == "busy"
 
 
@@ -217,8 +220,26 @@ def test_redact_urls_emails_repos_and_custom(tmp_path):
     assert "::1" not in red
     assert "fe80::1" not in red.lower()
     for keep in ("2026-10-20", "Ran 120 200 300 tests", "ASP.NET", "socket.io", "unit/integration",
-                 "text/plain"):
+                 "text/plain", "src/lib"):
         assert redact_text(keep, []) == keep
+
+
+def test_redact_phone_domain_path_and_public_ipv6():
+    plus86 = "+86 138 0013 8000"
+    spaced = "138 0013 8000"
+    bare = "13800138000"
+    for raw in (f"call {plus86} now", f"mobile {bare}", f"sms {spaced}"):
+        out = redact_text(raw, [])
+        assert "138" not in out
+        assert "[redacted]" in out
+    host = "billing.example.com"
+    assert host not in redact_text(f"see {host} today", [])
+    assert "src/secret-billing" not in redact_text("path src/secret-billing end", [])
+    # 3fff::/20 is the documentation prefix. It is not a private address, so it used to leak.
+    public_v6 = "3fff:0:0:0:0:0:0:1"
+    red_v6 = redact_text(f"addr {public_v6}", [])
+    assert "3fff" not in red_v6.lower()
+    assert "[redacted]" in red_v6
 
 
 # --------------------------------------------------------------------------- HTTP: auth, scope, tiers
@@ -874,3 +895,320 @@ def test_hidden_agent_card_omits_roster_extension(tmp_path):
         other = httpx.get(base + "/agents/other/.well-known/agent-card.json").json()
         ouris = [e["uri"] for e in other["capabilities"]["extensions"]]
         assert "urn:a2a-bridge:roster:v1" in ouris
+
+
+def test_redact_long_input_stays_fast():
+    raw = ("a." * 30000) + "corp secret-tail"
+    started = time.perf_counter()
+    out = redact_text(raw, [])
+    assert time.perf_counter() - started < 0.5
+    assert len(out) <= 120
+    assert "secret-tail" not in out
+
+
+def test_rate_limit_does_not_count_as_failure(tmp_path):
+    _, store, roster = make_roster(tmp_path, A2A_ROSTER_OFFLINE_AFTER_S="1")
+    now = time.time()
+    for i in range(3):
+        roster.note_delivery_err("coder", "HTTP 429: slow down", dead=False, rate_limited=True,
+                                 retry_in_s=30, http_status=429, now=now + i)
+    row = store.presence_get("coder")
+    assert row["consecutive_failures"] == 0
+    assert row["last_delivery_err_at"] is None
+    assert row["throttled_until"] >= now + 30
+    rec = _status(roster, now=now + 3)
+    assert rec["status"] != "offline"
+    assert rec["capacity"]["throttled"] is True
+    roster.note_delivery_err("coder", "HTTP 500: boom", dead=False, rate_limited=False,
+                             http_status=500, now=now + 3)
+    assert store.presence_get("coder")["consecutive_failures"] == 1
+    store.close()
+
+
+def test_partial_recompute_does_not_refresh_computed_at(tmp_path):
+    _, store, roster = make_roster(tmp_path)
+    roster.recompute(now=1_700_000_000)
+    assert roster._computed_at == 1_700_000_000
+    roster.recompute(names=["coder"], now=time.time())
+    assert roster._computed_at == 1_700_000_000
+    assert roster.is_stale()
+    store.close()
+
+
+def test_expire_keeps_auth_lock_written_during_recompute(tmp_path):
+    s, store, roster = make_roster(tmp_path, A2A_ROSTER_OFFLINE_TTL_S="60")
+    old = time.time() - 1000
+    store.presence_update("coder", delivery_dead=1, delivery_dead_at=old,
+                          last_delivery_err_at=old, last_delivery_err="HTTP 401: old")
+    entered = threading.Event()
+    release = threading.Event()
+    orig = store.roster_signals
+
+    def paused(hour_ago):
+        sig = orig(hour_ago)
+        entered.set()
+        assert release.wait(3)
+        return sig
+
+    store.roster_signals = paused
+    fresh = time.time()
+    holder: dict = {}
+
+    def run():
+        holder["out"] = roster._compute(None, {}, fresh)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert entered.wait(3)
+    store.presence_update("coder", delivery_dead=1, delivery_dead_at=fresh,
+                          last_delivery_err_at=fresh, last_delivery_err="HTTP 401: new")
+    release.set()
+    worker.join(3)
+    assert not worker.is_alive()
+    row = store.presence_get("coder")
+    assert row["delivery_dead"] == 1
+    assert abs(float(row["delivery_dead_at"]) - fresh) < 1
+    assert holder["out"][0]["coder"]["status"] == "offline"
+    store.close()
+
+
+def test_expire_keeps_failure_count_written_during_recompute(tmp_path):
+    _, store, roster = make_roster(tmp_path, A2A_ROSTER_OFFLINE_TTL_S="60")
+    old = time.time() - 1000
+    store.presence_update("coder", consecutive_failures=3, failures_since=old,
+                          last_delivery_err_at=old, last_delivery_err="timeout")
+    snap = store.presence_get("coder")
+    fresh = time.time()
+    store.presence_update("coder", consecutive_failures=4, failures_since=fresh,
+                          last_delivery_err_at=fresh, last_delivery_err="HTTP 500")
+    kept = roster._expire_failure_streak("coder", snap, fresh)
+    row = store.presence_get("coder")
+    assert row["consecutive_failures"] == 4
+    assert abs(float(row["last_delivery_err_at"]) - fresh) < 1
+    assert kept["consecutive_failures"] == 4
+    store.close()
+
+
+def test_recompute_is_single_flight_and_drops_older_results(tmp_path):
+    _, store, roster = make_roster(tmp_path)
+    roster.recompute()
+    base = roster._computed_at
+    assert base is not None
+    current = {"n": 0, "max": 0}
+    gate = threading.Lock()
+    orig = roster._compute
+
+    def wrapped(names, prev, now):
+        with gate:
+            current["n"] += 1
+            current["max"] = max(current["max"], current["n"])
+        try:
+            time.sleep(0.12)
+            return orig(names, prev, now)
+        finally:
+            with gate:
+                current["n"] -= 1
+
+    roster._compute = wrapped
+
+    async def main():
+        await asyncio.gather(
+            roster.recompute_async(["coder"]),
+            roster.recompute_async(None),
+            roster.recompute_async(["other"]),
+        )
+
+    asyncio.run(main())
+    assert current["max"] == 1
+    stale = dict(roster.last("coder"))
+    stale["status"] = "offline"
+    assert roster._apply({"coder": stale}, ["coder"], base - 5, publish=False, full=True) is False
+    assert roster.last("coder")["status"] != "offline"
+    assert roster._computed_at >= base
+    store.close()
+
+
+def test_dirty_during_recompute_is_kept_for_the_next_run(tmp_path):
+    _, store, roster = make_roster(tmp_path)
+    roster.recompute()
+    started = threading.Event()
+    release = threading.Event()
+    orig = roster._compute
+
+    def wrapped(names, prev, now):
+        started.set()
+        assert release.wait(3)
+        return orig(names, prev, now)
+
+    roster._compute = wrapped
+
+    async def main():
+        task = asyncio.create_task(roster.recompute_async(["coder"]))
+        await asyncio.to_thread(started.wait, 3)
+        roster.touch("other")
+        release.set()
+        await task
+
+    asyncio.run(main())
+    assert "other" in roster._dirty
+    assert "coder" not in roster._dirty
+    store.close()
+
+
+def test_sweeper_and_recompute_fail_independently(tmp_path):
+    s, store, roster = make_roster(tmp_path, A2A_SWEEP_INTERVAL_S="0.01")
+    bridge = Bridge(s, store, EventBus(), None)
+    bridge.roster = roster
+    calls = {"sweep": 0, "re": 0}
+
+    def boom_sweep():
+        calls["sweep"] += 1
+        raise RuntimeError("sweep broke")
+
+    async def boom_re(names=None):
+        calls["re"] += 1
+        raise RuntimeError("recompute broke")
+
+    bridge.sweep = boom_sweep
+    roster.recompute_async = boom_re
+
+    async def main():
+        task = asyncio.create_task(bridge._sweeper_loop())
+        await asyncio.sleep(0.08)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())
+    assert calls["sweep"] >= 1
+    assert calls["re"] >= 1
+    store.close()
+
+
+def test_roster_signals_do_not_take_the_writer_lock(tmp_path):
+    _, store, _roster = make_roster(tmp_path)
+    store._lock.acquire()
+    done = threading.Event()
+    errors: list = []
+
+    def run():
+        try:
+            store.roster_signals(time.time() - 3600)
+        except Exception as e:  # pragma: no cover - assertion below
+            errors.append(e)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert done.wait(1), "roster_signals blocked on the writer lock"
+    store._lock.release()
+    worker.join(1)
+    assert not errors
+    store._read_lock.acquire()
+    try:
+        started = time.perf_counter()
+        assert store.ping() is True
+        assert time.perf_counter() - started < 0.05
+    finally:
+        store._read_lock.release()
+    store.close()
+
+
+def test_roster_signals_large_db_stays_fast_with_and_without_analyze(tmp_path):
+    """100k tasks / 200k outbox rows, the size that picked the wrong index."""
+    _, store, _roster = make_roster(tmp_path)
+    now = time.time()
+    n_tasks, n_out = 100_000, 200_000
+    tasks = [(f"t{i}", "c", "coder", "main", "submitted" if i < 20 else "completed",
+              "{}", "[]", now, now) for i in range(n_tasks)]
+    outs = [("bot", f"t{i % n_tasks}", f"d{i}", "http://127.0.0.1/hook", "{}", "{}",
+             1, now, "pending" if i < 10 else "done", now) for i in range(n_out)]
+    with store._lock:
+        store._db.execute("BEGIN")
+        store._db.executemany(
+            "INSERT INTO tasks(id,context_id,agent,owner,state,status_json,artifacts_json,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", tasks)
+        store._db.executemany(
+            "INSERT INTO outbox(kind,task_id,delivery_id,url,headers_json,body,attempts,"
+            "next_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", outs)
+        store._db.execute("COMMIT")
+
+    def plan(sql: str) -> str:
+        return " ".join(" ".join(str(c) for c in row) for row in store._read("EXPLAIN QUERY PLAN " + sql))
+
+    def timed(label: str) -> None:
+        started = time.perf_counter()
+        sig = store.roster_signals(now - 3600)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.15, f"{label} took {elapsed:.3f}s"
+        assert len(sig["delivered_submitted"]) == 20
+        assert sig["outbox_pending"]["coder"] == 10
+
+    delivered_plan = plan(SQL_DELIVERED_SUBMITTED)
+    pending_plan = plan(SQL_OUTBOX_PENDING)
+    assert "ix_outbox_task_kind_status" in delivered_plan
+    assert "ix_outbox_kind_status" in pending_plan
+    timed("without ANALYZE")
+    with store._lock:
+        store._db.execute("ANALYZE")
+    assert "ix_outbox_task_kind_status" in plan(SQL_DELIVERED_SUBMITTED)
+    assert "ix_outbox_kind_status" in plan(SQL_OUTBOX_PENDING)
+    timed("with ANALYZE")
+    store.close()
+
+
+def test_backfill_status_text_marks_rows_and_skips_terminal_json(tmp_path):
+    s, store, _roster = make_roster(tmp_path)
+    big = "Z" * 200_000
+    working = {"state": "working", "message": {"parts": [
+        {"kind": "file", "file": {"bytes": big}},
+        {"kind": "text", "text": "visible line"},
+        {"kind": "text", "text": "second"},
+    ]}}
+    done = {"state": "completed", "blob": big, "message": {"parts": [
+        {"kind": "text", "text": "finished privately"},
+    ]}}
+    cols = ("INSERT INTO tasks(id,context_id,agent,owner,state,status_json,artifacts_json,"
+            "status_text,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    store._x(cols, ("w", "c", "coder", "main", "working", json.dumps(working), "[]", None, 1, 1))
+    store._x(cols, ("d", "c", "coder", "main", "completed", json.dumps(done), "[]", None, 1, 1))
+    store._x(cols, ("bad", "c", "coder", "main", "working", "not-json", "[]", None, 1, 1))
+    path = s.db_path
+    store.close()
+    again = Store(path)
+    w = again.get_task("w")
+    d = again.get_task("d")
+    assert w is not None and w["status_text"] == "visible line\nsecond"
+    assert d is not None and d["status_text"] == ""
+    assert again.get_task("bad")["status_text"] == ""
+    again.close()
+    third = Store(path)
+    assert third.get_task("w")["status_text"] == "visible line\nsecond"
+    assert third.get_task("d")["status_text"] == ""
+    third.close()
+
+
+def test_concurrent_store_open_retries_database_locked(tmp_path):
+    db = tmp_path / "wal-race.db"
+    script = (
+        "import sys\n"
+        "from a2a_bridge.db import Store\n"
+        "s = Store(sys.argv[1])\n"
+        "assert s.ping()\n"
+        "s.close()\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    failures = []
+    for _wave in range(3):
+        procs = [subprocess.Popen([sys.executable, "-c", script, str(db)], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                 for _ in range(8)]
+        for proc in procs:
+            _out, err = proc.communicate(timeout=40)
+            if proc.returncode != 0:
+                failures.append(err.decode()[-400:])
+    assert not failures, failures

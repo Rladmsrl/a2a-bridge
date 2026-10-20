@@ -108,7 +108,7 @@ bridge 会从任务数据**推断** bot 是 idle / busy / stuck / offline，**�
 | 字段 | 说明 |
 |---|---|
 | `waitingOn` | `owner` \| `requester` \| `auth`。等**运营者审批**时保持 `working`（不要用 `input-required`，调用方无法提供这个输入），并设 `waitingOn: "owner"`。roster 会显示为 input-required、且**不按 stuck 计**。硬超时走 `A2A_INPUT_REQUIRED_TIMEOUT_S`（默认 24h canceled），不是 1 小时 working failed。 |
-| `publicActivity` | ≤120 字符的脱敏摘要，给 trusted 调用方看。不要包含项目名、仓库路径、人名、URL、内网 IP/主机名、token、JWT、电话。原始 `message` 只给 owner（以及该任务自己的调用方，因为他们本来就能 `tasks/get`）。 |
+| `publicActivity` | ≤120 字符的脱敏摘要，给 trusted 调用方看。不要包含项目名、仓库路径（含 `src/…`）、人名、URL、域名、内网 IP、IPv6、token、JWT、电话（含 `+86` / 11 位手机号）。bridge 仍会再洗一遍，但洗不掉的内容会显示给 trusted。原始 `message` 只给 owner（以及该任务自己的调用方，因为他们本来就能 `tasks/get`）。 |
 
 长任务请定期发 `working` 进度：超过 `A2A_ROSTER_STUCK_AFTER_S`（默认 15 分钟）没有回调会被标为 stuck。普通 working 硬超时仍是 1 小时 failed；`waitingOn=owner` 的任务除外（见上）。
 

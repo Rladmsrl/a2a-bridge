@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE INDEX IF NOT EXISTS ix_outbox_due ON outbox(status, next_at);
 CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id);
 CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status);
+-- Covering lookup for "does this task have a done bot delivery?" Without it the
+-- planner uses ix_outbox_kind_status and scans every done row per submitted task.
+CREATE INDEX IF NOT EXISTS ix_outbox_task_kind_status ON outbox(task_id, kind, status);
 CREATE TABLE IF NOT EXISTS push_configs (
   task_id TEXT NOT NULL,
   id TEXT NOT NULL,
@@ -108,19 +111,90 @@ _PRESENCE_COLS = {
 }
 
 
+# Pinned plans. A database that never ran ANALYZE (the production default) otherwise
+# picks ix_outbox_kind_status for the delivered lookup, and after ANALYZE the pending
+# count can fall back to a full outbox scan.
+SQL_DELIVERED_SUBMITTED = (
+    "SELECT t.id FROM tasks t WHERE t.state='submitted' AND EXISTS ("
+    "SELECT 1 FROM outbox o INDEXED BY ix_outbox_task_kind_status "
+    "WHERE o.task_id=t.id AND o.kind='bot' AND o.status='done')"
+)
+SQL_OUTBOX_PENDING = (
+    "SELECT t.agent, COUNT(*) FROM outbox o INDEXED BY ix_outbox_kind_status "
+    "JOIN tasks t ON t.id=o.task_id "
+    "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent"
+)
+
+
 class Store:
     def __init__(self, path: str):
-        if path != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
+        self._read_db: sqlite3.Connection | None = None
         self._lock = threading.RLock()
-        with self._lock:
-            self._db.execute("PRAGMA busy_timeout=5000")
-            self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=NORMAL")
-            self._db.executescript(SCHEMA)
-            self._migrate()
+        self._read_lock = threading.Lock()
+        self._memory = path == ":memory:"
+        if self._memory:
+            # A second connection only shares an in-memory database via a shared-cache URI.
+            self._path = f"file:bridge-{id(self)}?mode=memory&cache=shared"
+            self._db = sqlite3.connect(self._path, uri=True, check_same_thread=False, isolation_level=None)
+        else:
+            self._path = path
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.row_factory = sqlite3.Row
+        self._init_writer()
+        self._read_db = self._open_reader()
+
+    def _connect(self, *, query_only: bool) -> sqlite3.Connection:
+        if self._memory:
+            conn = sqlite3.connect(self._path, uri=True, check_same_thread=False, isolation_level=None)
+        else:
+            conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        if query_only:
+            conn.execute("PRAGMA query_only=ON")
+        return conn
+
+    def _rollback_quiet(self) -> None:
+        try:
+            self._db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def _init_writer(self) -> None:
+        """Open WAL and migrate. Retry if several processes switch the file to WAL at once."""
+        delay = 0.02
+        for attempt in range(8):
+            try:
+                with self._lock:
+                    self._db.execute("PRAGMA busy_timeout=5000")
+                    self._db.execute("PRAGMA journal_mode=WAL").fetchone()
+                    self._db.execute("PRAGMA synchronous=NORMAL")
+                    self._db.executescript(SCHEMA)
+                    self._migrate()
+                return
+            except sqlite3.OperationalError as e:
+                self._rollback_quiet()
+                if "locked" not in str(e).lower() or attempt == 7:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
+
+    def _open_reader(self) -> sqlite3.Connection:
+        """Read-only connection for background roster queries.
+
+        The event-loop connection and its lock stay free while a long read runs.
+        """
+        delay = 0.02
+        for attempt in range(8):
+            try:
+                return self._connect(query_only=True)
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 7:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
+        raise sqlite3.OperationalError("database is locked")
 
     def _migrate(self) -> None:
         """Idempotent column/index adds. BEGIN IMMEDIATE serializes concurrent startups."""
@@ -136,6 +210,8 @@ class Store:
             self._ensure_column("agent_presence", "last_terminal_at", "REAL")
             self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id)")
             self._db.execute("CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status)")
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_outbox_task_kind_status ON outbox(task_id, kind, status)")
             self._db.execute("UPDATE outbox SET status='pending' WHERE status='inflight'")
             self._backfill_status_text()
             self._backfill_presence()
@@ -160,21 +236,28 @@ class Store:
                 raise
 
     def _backfill_status_text(self) -> None:
-        cur = self._db.execute("SELECT id, status_json FROM tasks WHERE status_text IS NULL")
-        while True:
-            batch = cur.fetchmany(200)
-            if not batch:
-                return
-            for tid, raw in batch:
-                try:
-                    status = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(status, dict):
-                    continue
-                text = _text_from_status(status)
-                if text:
-                    self._db.execute("UPDATE tasks SET status_text=? WHERE id=?", (text, tid))
+        """Fill status_text once. Terminal rows are marked and not parsed.
+
+        An empty string means "already considered", so the next boot does not walk
+        those rows again. Non-terminal text is extracted inside SQLite; the full
+        status_json (which may carry file bytes) is never loaded into Python.
+        """
+        self._db.execute(
+            "UPDATE tasks SET status_text='' WHERE status_text IS NULL "
+            "AND state IN ('completed','failed','canceled','rejected')")
+        # Anything that is not a JSON array of parts cannot be extracted. Mark it so
+        # startup does not parse it again, and so json_each is never handed a string.
+        self._db.execute(
+            "UPDATE tasks SET status_text='' WHERE status_text IS NULL AND NOT ("
+            "json_valid(status_json)=1 AND json_type(status_json, '$.message.parts')='array')")
+        self._db.execute(
+            "UPDATE tasks SET status_text=COALESCE(("
+            "SELECT substr(group_concat(json_extract(j.value, '$.text'), char(10)), 1, 500) "
+            "FROM json_each(json_extract(tasks.status_json, '$.message.parts')) AS j "
+            "WHERE json_extract(j.value, '$.kind')='text' "
+            "AND json_type(j.value, '$.text')='text' "
+            "AND json_extract(j.value, '$.text')!=''"
+            "), '') WHERE status_text IS NULL")
 
     def _backfill_presence(self) -> None:
         self._db.execute(
@@ -197,12 +280,24 @@ class Store:
             "WHERE consecutive_failures>=3 AND failures_since IS NULL AND last_delivery_err_at IS NOT NULL")
 
     def close(self) -> None:
+        with self._read_lock:
+            if self._read_db is not None:
+                self._read_db.close()
+                self._read_db = None
         with self._lock:
             self._db.close()
 
     def _x(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._db.execute(sql, args)
+
+    def _read(self, sql: str, args: tuple = ()) -> list:
+        """Query on the read-only connection. Does not take the writer lock."""
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                raise sqlite3.ProgrammingError("store is closed")
+            return db.execute(sql, args).fetchall()
 
     def ping(self) -> bool:
         return self._x("SELECT 1").fetchone()[0] == 1
@@ -396,22 +491,38 @@ class Store:
         args.append(agent)
         self._x(f"UPDATE agent_presence SET {', '.join(sets)} WHERE agent=?", tuple(args))
 
+    def presence_clear_auth_lock(self, agent: str, delivery_dead_at: float | None) -> bool:
+        """Clear the auth lock only if it is still the snapshot the caller decided on."""
+        cur = self._x(
+            "UPDATE agent_presence SET delivery_dead=0, delivery_dead_at=NULL, updated_at=? "
+            "WHERE agent=? AND delivery_dead=1 AND delivery_dead_at IS ?",
+            (time.time(), agent, delivery_dead_at))
+        return cur.rowcount > 0
+
+    def presence_clear_failure_streak(self, agent: str, consecutive_failures: int,
+                                      last_delivery_err_at: float | None) -> bool:
+        """Reset the failure counter only if both the count and the last error are unchanged."""
+        cur = self._x(
+            "UPDATE agent_presence SET consecutive_failures=0, failures_since=NULL, updated_at=? "
+            "WHERE agent=? AND consecutive_failures=? AND last_delivery_err_at IS ?",
+            (time.time(), agent, int(consecutive_failures), last_delivery_err_at))
+        return cur.rowcount > 0
+
     def roster_signals(self, hour_ago: float) -> dict[str, Any]:
-        """Cheap aggregates for roster inference. Does not load status_json (may contain files)."""
-        active = [dict(r) for r in self._x(
+        """Cheap aggregates for roster inference. Does not load status_json (may contain files).
+
+        Uses the read-only connection so a slow aggregate cannot block event-loop reads.
+        """
+        active = [dict(r) for r in self._read(
             "SELECT id,agent,owner,state,waiting_on,public_activity,status_text,created_at,updated_at "
-            "FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')").fetchall()]
-        failed = {r[0]: r[1] for r in self._x(
+            "FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')")]
+        failed = {r[0]: r[1] for r in self._read(
             "SELECT agent, COUNT(*) FROM tasks WHERE state='failed' AND updated_at>=? GROUP BY agent",
-            (hour_ago,)).fetchall()}
-        presence = {r["agent"]: dict(r) for r in self._x("SELECT * FROM agent_presence").fetchall()}
+            (hour_ago,))}
+        presence = {r["agent"]: dict(r) for r in self._read("SELECT * FROM agent_presence")}
         last_term = {a: p["last_terminal_at"] for a, p in presence.items()
                      if p.get("last_terminal_at") is not None}
-        pending = {r[0]: r[1] for r in self._x(
-            "SELECT t.agent, COUNT(*) FROM outbox o JOIN tasks t ON t.id=o.task_id "
-            "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent").fetchall()}
-        delivered_sub = {r[0] for r in self._x(
-            "SELECT t.id FROM tasks t WHERE t.state='submitted' AND EXISTS ("
-            "SELECT 1 FROM outbox o WHERE o.task_id=t.id AND o.kind='bot' AND o.status='done')").fetchall()}
+        pending = {r[0]: r[1] for r in self._read(SQL_OUTBOX_PENDING)}
+        delivered_sub = {r[0] for r in self._read(SQL_DELIVERED_SUBMITTED)}
         return {"active": active, "failed_hour": failed, "last_terminal": last_term,
                 "outbox_pending": pending, "delivered_submitted": delivered_sub, "presence": presence}

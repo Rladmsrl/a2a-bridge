@@ -484,8 +484,23 @@ class Bridge:
         while True:
             try:
                 await asyncio.sleep(self.s.sweep_interval_s)
+            except asyncio.CancelledError:
+                raise
+            # Sweep and roster recompute fail independently. A partial roster run must
+            # not be the only thing that advances the cache when the full recompute errors.
+            try:
                 self.sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("sweeper error")
+            try:
                 await self.roster.recompute_async()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("roster recompute error")
+            try:
                 if time.time() - last_purge > 3600 and self.s.retention_days > 0:
                     n = self.store.purge_terminal(time.time() - self.s.retention_days * 86400)
                     last_purge = time.time()
@@ -494,7 +509,7 @@ class Bridge:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("sweeper error")
+                log.exception("purge error")
 
     def sweep(self) -> int:
         now = time.time()

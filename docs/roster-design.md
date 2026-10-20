@@ -42,7 +42,7 @@
 
 ## 3. API 规格
 
-所有路径与 JSON-RPC 同一 host；认证与 JSON-RPC 相同：有 Bearer 用 Bearer，否则用 `X-API-Key`（反向代理加上的 `Basic` 不会挡住有效的 `X-API-Key`）。`A2A_ROSTER_PUBLIC=true` 时只有**完全不带凭据**才算匿名；畸形 Authorization 且没有有效 key 一律 401。响应 `Cache-Control: no-store`，带 `ETag`（视图哈希，不含 `generatedAt` / `computedAt` / `stale` / `statusDurationS`），支持 `If-None-Match` → 304。GET 只读缓存。`computedAt` 是缓存计算时间；缓存比 `3 * A2A_SWEEP_INTERVAL_S` 更旧（或尚未计算）时返回 **503** `{"error":"degraded","stale":true}`。
+所有路径与 JSON-RPC 同一 host；认证与 JSON-RPC 相同：有 Bearer 用 Bearer，否则用 `X-API-Key`（反向代理加上的 `Basic` 不会挡住有效的 `X-API-Key`）。`A2A_ROSTER_PUBLIC=true` 时只有**完全不带凭据**才算匿名；畸形 Authorization 且没有有效 key 一律 401。响应 `Cache-Control: no-store`，带 `ETag`（视图哈希，不含 `generatedAt` / `computedAt` / `stale` / `statusDurationS`），支持 `If-None-Match` → 304。GET 只读缓存。`computedAt` 是**全量**重算开始的时间，只在全量重算成功时推进；只重算部分 agent 不会刷新它。缓存比 `3 * A2A_SWEEP_INTERVAL_S` 更旧（或尚未计算）时返回 **503** `{"error":"degraded","stale":true}`。全量重算持续失败时，即使有 agent 在活动，过期缓存仍然 503。
 
 ### 3.1 `GET /roster`
 
@@ -162,7 +162,7 @@ GROUP BY agent, state;
 
 | 状态 | 规则 | 依据代码 |
 |---|---|---|
-| `offline` | 最近一次 **HTTP 401/403/404** 记在 `delivery_dead_at`（不是 `last_delivery_err_at`），之后没有更新的成功投递/回调，且仍在 `A2A_ROSTER_OFFLINE_TTL_S`(3600s) 内。TTL 过后清掉 `delivery_dead`，后续的超时/500 **不会**把锁刷回来。另外：连续 ≥3 次失败，且失败串已持续 `A2A_ROSTER_OFFLINE_AFTER_S`(120s)、最后一次失败仍在 TTL 内——**不要求**还有 submitted 任务（webhook 一直不可达、任务已 failed 时也是 offline）。 | `note_delivery_err`、`_expire_auth_lock` |
+| `offline` | 最近一次 **HTTP 401/403/404** 记在 `delivery_dead_at`（不是 `last_delivery_err_at`），之后没有更新的成功投递/回调，且仍在 `A2A_ROSTER_OFFLINE_TTL_S`(3600s) 内。TTL 过后清掉 `delivery_dead`，后续的超时/500 **不会**把锁刷回来。清理是条件更新：只有 `delivery_dead_at` 仍等于这次快照才清，重算期间主线程新写入的 401 不会被清掉。另外：连续 ≥3 次失败，且失败串已持续 `A2A_ROSTER_OFFLINE_AFTER_S`(120s)、最后一次失败仍在 TTL 内——**不要求**还有 submitted 任务（webhook 一直不可达、任务已 failed 时也是 offline）。失败计数同样只在计数和 `last_delivery_err_at` 都没变时才清零。限流（HTTP 429，或响应体像 rate limit 的 4xx）**只**写 `throttled_until`，不增加 `consecutive_failures`，也不刷新 `last_delivery_err_at`，所以三次 429 不会变成 offline。 | `note_delivery_err`、`_expire_auth_lock` |
 | `stuck` | 存在 working 任务，`waiting_on` 不是 owner，且 `now - updated_at > stuck_after_s`（默认 `A2A_ROSTER_STUCK_AFTER_S`=900s，agents.json 可按 bot 覆盖 `stuck_after_s`，必须 < `task_timeout_s`）；或 submitted 任务已成功投递但超过 300s 没变 working | `updated_at` 刷新点：`db.py:111-120`、`service.py:291,302`；硬超时 `service.py:452-456` |
 | `busy` | working 数 ≥ 1（`active`）；若 `active ≥ maxConcurrent` 或最近投递命中限流（`_RATE_LIMIT_RE`）则 `availability=unavailable`、`throttled=true` | `service.py:414-431`（2xx 后转 working）、`service.py:25-27,378-379` |
 | `input-required` | 没有 working，但有 input-required/auth-required 任务，或 working 任务带 `waiting_on="owner"`；`waitingOn` ∈ `requester`/`owner`/`auth` | `models.py:18` `INTERRUPTED`；`service.py:298-302` |
@@ -184,9 +184,9 @@ GROUP BY agent, state;
 对 Grok Bot 这类 webhook 驱动的 agent，webhook 本身就是自动化运行入口（参见 `service.py:25-27` 对平台限流响应的处理），任何探测都会触发一次运行并消耗限额。因此空闲 bot 的在线性只能从“最近一次投递/回调”推断。可选的第三阶段：允许 bot 用共享密钥签名 `POST /presence/{agent}` 做低频心跳——但这属于自报，默认关闭。
 
 ### 4.5 实时性
-- 事件驱动：`_set_status`、新建任务、`_deliver` 成功/失败、`apply_callback` 时调用 `roster.touch(agent)`。后台循环在安静 `A2A_ROSTER_DEBOUNCE_S`(1s) **或** 脏数据已持续 `A2A_ROSTER_DEBOUNCE_MAX_S`(2s) 时重算。SQL 在线程里跑，EventBus 发布留在事件循环。
-- 时间驱动：stuck/offline 随时间变化。`_sweeper_loop` 每 `sweep_interval_s`(30s) 调 `recompute_async()`。HTTP GET 不重算。
-- 热路径：`roster_signals` 不扫全表终态（`last_terminal_at` 在任务进入终态时写入 presence）；已投递的 submitted 用 `EXISTS` 而不是大 JOIN。
+- 事件驱动：`_set_status`、新建任务、`_deliver` 成功/失败、`apply_callback` 时调用 `roster.touch(agent)`。后台循环在安静 `A2A_ROSTER_DEBOUNCE_S`(1s) **或** 脏数据已持续 `A2A_ROSTER_DEBOUNCE_MAX_S`(2s) 时重算。SQL 在线程里跑，EventBus 发布留在事件循环。`recompute_async` 用一把 `asyncio.Lock`，debounce 和 sweeper 不会同时算。运行期间新标脏的 agent 留到下一轮。结果只在开始时间晚于当前 `computedAt` 时才写入缓存。
+- 时间驱动：stuck/offline 随时间变化。`_sweeper_loop` 每 `sweep_interval_s`(30s) 调全量 `recompute_async()`。sweep 和这次重算各有自己的 try，一个失败不跳过另一个。HTTP GET 不重算。
+- 热路径：`roster_signals` 走单独的只读连接，不占用事件循环那条连接的锁，也不扫全表终态（`last_terminal_at` 在任务进入终态时写入 presence）。已投递的 submitted 用 `EXISTS`，并 `INDEXED BY ix_outbox_task_kind_status`。pending 计数钉在 `ix_outbox_kind_status`。没跑过 `ANALYZE` 和跑过之后都是这个计划。
 
 ## 5. 数据模型变更
 
@@ -215,13 +215,14 @@ ALTER TABLE tasks ADD COLUMN status_text TEXT;        -- 从 status_json 抽出�
 CREATE INDEX IF NOT EXISTS ix_tasks_agent_state ON tasks(agent, state, updated_at);
 CREATE INDEX IF NOT EXISTS ix_outbox_task ON outbox(task_id);
 CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status);
+CREATE INDEX IF NOT EXISTS ix_outbox_task_kind_status ON outbox(task_id, kind, status);
 -- 阶段 3（未实现）才会需要 roster_subscriptions
 ```
 配置新增：
 - agents.json 每个 agent 可选：`max_concurrent`（默认 1）、`stuck_after_s`、`roster_visible`（默认 true，可把内部 bot 从 roster 隐藏）。
 - 环境变量：`A2A_KEY_TIERS`（如 `ops:owner,partner-1:trusted`，未列出默认 `basic`）、`A2A_ROSTER_STUCK_AFTER_S`(900)、`A2A_ROSTER_OFFLINE_AFTER_S`(120)、`A2A_ROSTER_OFFLINE_TTL_S`(3600)、`A2A_ROSTER_MAX_STREAMS_PER_KEY`(3)、`A2A_ROSTER_MAX_STREAMS`(32)、`A2A_ROSTER_MAX_ANON_STREAMS`(3)、`A2A_ROSTER_STREAM_TIMEOUT_S`(30)、`A2A_ROSTER_STREAM_MAX_S`(300)、`A2A_ROSTER_PUBLIC`(false，是否允许匿名看 availability)、`A2A_ROSTER_REDACT`（逗号分隔的敏感词/正则）、`A2A_ROSTER_DEBOUNCE_S`(1)、`A2A_ROSTER_DEBOUNCE_MAX_S`(2)。`A2A_ALERT_WEBHOOK_URL` 属于阶段 3，尚未使用。
 - `ApiKey` 增加 `tier: str = "basic"`，由 `A2A_KEY_TIERS` 填充；**不改** `A2A_API_KEYS` 语法，向后兼容。owner 仍与 `key.agents` 求交。
-- 迁移：`Store._migrate` 使用 `BEGIN IMMEDIATE`，`ALTER TABLE` 对已存在列容忍 duplicate column；启动时补 `status_text`（并从已有 `status_json` 回填纯文本）、presence 新列与 outbox 索引。`busy_timeout` 在 `journal_mode=WAL` 之前设置。agent 名 `stream` 保留。API key label `*` 保留（匿名流）。配置解析错误不回显密钥片段。`roster_visible=false` 的 Agent Card **不**带 roster 扩展。
+- 迁移：`Store._migrate` 使用 `BEGIN IMMEDIATE`，`ALTER TABLE` 对已存在列容忍 duplicate column；启动时补 `status_text`、presence 新列与 outbox 索引（含 `ix_outbox_task_kind_status`）。`status_text` 回填：终态行、空值、非法 JSON、以及 `message.parts` 不是数组的行写成空串作为已处理标记，不再解析；其余非终态用 `json_extract` / `json_each` 只取出文本字段。空串或已有文本的行下次启动不再扫。`busy_timeout` 在 `journal_mode=WAL` 之前设置；第一次切到 WAL 时若多个进程同时启动碰到 `database is locked`，外层会重试。agent 名 `stream` 保留。API key label `*` 保留（匿名流）。配置解析错误不回显密钥片段。`roster_visible=false` 的 Agent Card **不**带 roster 扩展。
 
 ## 6. 隐私分级
 
@@ -245,7 +246,7 @@ CREATE INDEX IF NOT EXISTS ix_outbox_kind_status ON outbox(kind, status);
 2. trusted 看到的 activity 来源优先级：
    a. bot 在回调里提供的 `metadata.roster.publicActivity`（BOT-SIDE.md 约定：不含项目/仓库/人名/URL，≤120 字符），存入 `tasks.public_activity`；
    b. 否则用模板：`"Working on a <skill name> task"` / `"Waiting for requester input"` / `"Waiting for owner approval"`（skill 名来自 agents.json，可公开）。
-3. 即使是 (a) 也过一遍清洗：去掉 URL、邮箱、`org/repo`（跳过 `text/plain`、`unit/integration` 这类通用片段）、长 hex/uuid、私网/回环/链路本地 IP（含 `::1`、`fe80::1`）、内网主机名（`.local`/`.internal`/`.corp` 等，**不**把 `ASP.NET`、`socket.io` 当主机名）、GitHub/AWS token、JWT、像电话的号码（不误伤 `2026-10-20` 或 `120 200 300`）。命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，截断 120 字符。
+3. 即使是 (a) 也过一遍清洗：入口先把字符串截到 512 字符（主机名/邮箱正则在超长输入上会回溯），再去掉 URL、邮箱、`org/repo`（`text/plain` 这类 MIME 保留；`unit/integration` 这类通用片段只有左右两边都是通用词才保留，所以 `src/secret-billing` 会去掉）、长 hex/uuid、私网/回环/链路本地 IPv4、全部 IPv6（含公网地址，以及 `::1`、`fe80::1`）、内网主机名（`.local`/`.internal`/`.corp` 等）和普通域名（如 `billing.example.com`）。**不**把 `ASP.NET`、`socket.io` 当主机名。GitHub/AWS token、JWT、电话（含 `+86` 和以 138 开头的 11 位手机号；不误伤 `2026-10-20` 或 `120 200 300`）同样去掉。命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，输出截断 120 字符。
 4. 请求方是自己的 key 时（`tasks.owner == key.label`），该 key 可以看到**自己任务**的原始状态消息——这和它通过 `tasks/get` 已经能拿到的信息一致，不额外泄露。
 
 ## 7. Agent Card 扩展与 A2A 兼容性
