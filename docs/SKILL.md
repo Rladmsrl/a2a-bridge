@@ -9,6 +9,7 @@ Use this skill to delegate a task to a remote agent exposed by an a2a-bridge ser
 ## Steps
 1. (Optional) Read the Agent Card to learn skills and expected input fields:
    `curl -s "$A2A_URL/.well-known/agent-card.json"`
+   Optionally check who is free (same API key): `curl -s "${A2A_URL%/agents/*}/roster" -H "Authorization: Bearer $A2A_KEY"` (see the card extension `urn:a2a-bridge:roster:v1`).
 2. Send the task (non-blocking) and remember `result.id` (taskId) and `result.contextId`:
    ```bash
    curl -s "$A2A_URL" -H "Authorization: Bearer $A2A_KEY" -H 'Content-Type: application/json' -d '{

@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+UNSET = object()
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -20,12 +22,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   status_json TEXT NOT NULL,
   artifacts_json TEXT NOT NULL DEFAULT '[]',
   metadata_json TEXT,
+  waiting_on TEXT,
+  public_activity TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_tasks_ctx ON tasks(context_id);
 CREATE INDEX IF NOT EXISTS ix_tasks_state ON tasks(state, updated_at);
 CREATE INDEX IF NOT EXISTS ix_tasks_owner ON tasks(owner, agent, updated_at);
+CREATE INDEX IF NOT EXISTS ix_tasks_agent_state ON tasks(agent, state, updated_at);
 CREATE TABLE IF NOT EXISTS messages (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id TEXT NOT NULL,
@@ -63,7 +68,25 @@ CREATE TABLE IF NOT EXISTS callback_events (
   created_at REAL NOT NULL,
   PRIMARY KEY (task_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS agent_presence (
+  agent TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  since REAL NOT NULL,
+  last_seen_at REAL,
+  last_delivery_ok_at REAL,
+  last_delivery_err_at REAL,
+  last_delivery_err TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  throttled_until REAL,
+  delivery_dead INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL
+);
 """
+
+_PRESENCE_COLS = {
+    "status", "since", "last_seen_at", "last_delivery_ok_at", "last_delivery_err_at",
+    "last_delivery_err", "consecutive_failures", "throttled_until", "delivery_dead", "updated_at",
+}
 
 
 class Store:
@@ -81,6 +104,15 @@ class Store:
             cols = {r[1] for r in self._db.execute("PRAGMA table_info(outbox)")}
             if "client_err_retries" not in cols:  # migration
                 self._db.execute("ALTER TABLE outbox ADD COLUMN client_err_retries INTEGER NOT NULL DEFAULT 0")
+            tcols = {r[1] for r in self._db.execute("PRAGMA table_info(tasks)")}
+            if "waiting_on" not in tcols:
+                self._db.execute("ALTER TABLE tasks ADD COLUMN waiting_on TEXT")
+            if "public_activity" not in tcols:
+                self._db.execute("ALTER TABLE tasks ADD COLUMN public_activity TEXT")
+            pcols = {r[1] for r in self._db.execute("PRAGMA table_info(agent_presence)")}
+            if pcols and "delivery_dead" not in pcols:
+                self._db.execute(
+                    "ALTER TABLE agent_presence ADD COLUMN delivery_dead INTEGER NOT NULL DEFAULT 0")
             # crash recovery: deliveries that were in flight are retried
             self._db.execute("UPDATE outbox SET status='pending' WHERE status='inflight'")
 
@@ -108,7 +140,8 @@ class Store:
         r = self._x("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return dict(r) if r else None
 
-    def update_task(self, task_id: str, status: dict | None = None, artifacts: list | None = None) -> None:
+    def update_task(self, task_id: str, status: dict | None = None, artifacts: list | None = None,
+                    waiting_on: Any = UNSET, public_activity: Any = UNSET) -> None:
         sets, args = ["updated_at=?"], [time.time()]
         if status is not None:
             sets += ["state=?", "status_json=?"]
@@ -116,6 +149,12 @@ class Store:
         if artifacts is not None:
             sets.append("artifacts_json=?")
             args.append(json.dumps(artifacts))
+        if waiting_on is not UNSET:
+            sets.append("waiting_on=?")
+            args.append(waiting_on)
+        if public_activity is not UNSET:
+            sets.append("public_activity=?")
+            args.append(public_activity)
         args.append(task_id)
         self._x(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", tuple(args))
 
@@ -246,3 +285,50 @@ class Store:
 
     def callback_forget(self, task_id: str, event_id: str) -> None:
         self._x("DELETE FROM callback_events WHERE task_id=? AND event_id=?", (task_id, event_id))
+
+    # ------------------------------------------------------------ roster / presence
+    def presence_ensure(self, agent: str, now: float | None = None) -> None:
+        t = time.time() if now is None else now
+        self._x("INSERT OR IGNORE INTO agent_presence(agent,status,since,consecutive_failures,"
+                "delivery_dead,updated_at) VALUES(?,?,?,?,?,?)", (agent, "idle", t, 0, 0, t))
+
+    def presence_update(self, agent: str, increment_failures: bool = False, **fields: Any) -> None:
+        now = fields.pop("updated_at", time.time())
+        self.presence_ensure(agent, now)
+        sets, args = [], []
+        for k, v in fields.items():
+            if k not in _PRESENCE_COLS:
+                raise ValueError(f"unknown presence column: {k}")
+            sets.append(f"{k}=?")
+            args.append(v)
+        if increment_failures:
+            sets.append("consecutive_failures=consecutive_failures+1")
+        if not sets:
+            return
+        sets.append("updated_at=?")
+        args.append(now)
+        args.append(agent)
+        self._x(f"UPDATE agent_presence SET {', '.join(sets)} WHERE agent=?", tuple(args))
+
+    def roster_signals(self, hour_ago: float) -> dict[str, Any]:
+        """One lock: active tasks plus the aggregates roster inference needs."""
+        with self._lock:
+            active = [dict(r) for r in self._db.execute(
+                "SELECT id,context_id,agent,owner,state,status_json,waiting_on,public_activity,"
+                "created_at,updated_at FROM tasks "
+                "WHERE state IN ('submitted','working','input-required','auth-required')")]
+            failed = {r[0]: r[1] for r in self._db.execute(
+                "SELECT agent, COUNT(*) FROM tasks WHERE state='failed' AND updated_at>=? GROUP BY agent",
+                (hour_ago,))}
+            last_term = {r[0]: r[1] for r in self._db.execute(
+                "SELECT agent, MAX(updated_at) FROM tasks WHERE state IN "
+                "('completed','failed','canceled','rejected') GROUP BY agent")}
+            pending = {r[0]: r[1] for r in self._db.execute(
+                "SELECT t.agent, COUNT(*) FROM outbox o JOIN tasks t ON t.id=o.task_id "
+                "WHERE o.kind='bot' AND o.status IN ('pending','inflight') GROUP BY t.agent")}
+            delivered_sub = {r[0] for r in self._db.execute(
+                "SELECT t.id FROM tasks t JOIN outbox o ON o.task_id=t.id "
+                "AND o.kind='bot' AND o.status='done' WHERE t.state='submitted'")}
+            presence = {r["agent"]: dict(r) for r in self._db.execute("SELECT * FROM agent_presence")}
+        return {"active": active, "failed_hour": failed, "last_terminal": last_term,
+                "outbox_pending": pending, "delivered_submitted": delivered_sub, "presence": presence}

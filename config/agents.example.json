@@ -37,6 +37,9 @@
           ]
         }
       ],
+      "max_concurrent": 1,
+      "stuck_after_s": 900,
+      "roster_visible": true,
       "provider": {
         "organization": "Example",
         "url": "https://example.com"

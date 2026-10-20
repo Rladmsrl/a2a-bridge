@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import logging
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,10 +17,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from . import models as M
-from .config import Settings, load_settings
+from .config import ApiKey, Settings, load_settings
 from .db import Store
 from .events import EventBus
 from .logging_setup import setup_logging
+from .roster import ROSTER_BUS_KEY, VALID_STATUSES
 from .security import RateLimiter, bearer, callback_token, match_api_key, verify_signature, SIG_HEADER
 from .service import Bridge, Conflict
 
@@ -34,6 +36,25 @@ V1 = {"SendMessage", "SendStreamingMessage", "GetTask", "ListTasks", "CancelTask
       "DeleteTaskPushNotificationConfig", "GetExtendedAgentCard"}
 STREAMING = {"message/stream", "tasks/resubscribe", "SendStreamingMessage", "SubscribeToTask"}
 SUPPORTED_VERSIONS = {"", "0.3", "1.0"}
+
+
+def _card_extensions(s: Settings, name: str, a) -> list[dict]:
+    exts: list[dict] = []
+    if a.required_inputs:
+        exts.append({"uri": "urn:a2a-bridge:input-fields:v1",
+                     "description": "Input fields this agent expects in the first message",
+                     "required": False, "params": {"fields": a.required_inputs}})
+    exts.append({
+        "uri": "urn:a2a-bridge:roster:v1",
+        "required": False,
+        "description": "Live availability of this agent; requires the same API key",
+        "params": {
+            "rosterUrl": f"{s.public_base_url}/roster/{name}",
+            "streamUrl": f"{s.public_base_url}/roster/stream",
+            "statusValues": list(VALID_STATUSES),
+        },
+    })
+    return exts
 
 
 # ---------------------------------------------------------------------------- body size limit (ASGI)
@@ -160,10 +181,7 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
             "version": a.version,
             "capabilities": {
                 "streaming": True, "pushNotifications": True, "stateTransitionHistory": False,
-                "extensions": ([{"uri": "urn:a2a-bridge:input-fields:v1",
-                                 "description": "Input fields this agent expects in the first message",
-                                 "required": False, "params": {"fields": a.required_inputs}}]
-                               if a.required_inputs else []),
+                "extensions": _card_extensions(s, name, a),
             },
             "securitySchemes": {"bearer": {
                 "type": "http", "scheme": "bearer", "description": "API key issued by the bridge operator",
@@ -212,6 +230,145 @@ def create_app(settings: Settings | None = None, http_client: httpx.AsyncClient 
         return JSONResponse({"status": "ok" if ok else "degraded", "db": ok, "version": __version__,
                              "outbox": b.store.outbox_stats(), "streams": b.bus.count()},
                             status_code=200 if ok else 503)
+
+    def roster_auth(req: Request) -> tuple[ApiKey | None, JSONResponse | None]:
+        presented = bearer(req.headers.get("authorization")) or req.headers.get("x-api-key")
+        key = match_api_key(s.api_keys, presented)
+        if key is None:
+            if presented or not s.roster_public:
+                log.warning("roster auth failed", extra={"ip": client_ip(req)})
+                return None, JSONResponse({"error": "unauthorized"}, status_code=401,
+                                          headers={"WWW-Authenticate": 'Bearer realm="a2a-bridge"'})
+            key = ApiKey(label="*", sha256="", agents=None, tier="anonymous")
+        else:
+            ok, retry = limiter.allow(f"key:{key.label}")
+            if not ok:
+                return None, JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                          headers={"Retry-After": str(int(retry) + 1)})
+        return key, None
+
+    def parse_roster_query(req: Request) -> tuple[list[str] | None, set[str] | None, bool, JSONResponse | None]:
+        agents = [x for x in req.query_params.getlist("agent") if x]
+        status_raw = req.query_params.get("status")
+        include = req.query_params.get("include")
+        status_filter = None
+        if status_raw:
+            parts = {p.strip() for p in status_raw.split(",") if p.strip()}
+            if not parts or not parts <= set(VALID_STATUSES):
+                return None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "status"}, status_code=400)
+            status_filter = parts
+        include_tasks = False
+        if include:
+            if include != "tasks":
+                return None, None, False, JSONResponse(
+                    {"error": "invalid parameter", "param": "include"}, status_code=400)
+            include_tasks = True
+        return (agents or None), status_filter, include_tasks, None
+
+    def roster_response(req: Request, body: dict, etag: str):
+        inm = req.headers.get("if-none-match")
+        if inm and etag in {x.strip() for x in inm.split(",")}:
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-store"})
+        return JSONResponse(body, headers={"ETag": etag, "Cache-Control": "no-store"})
+
+    @app.get("/roster")
+    async def roster_list(req: Request):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        agent_filter, status_filter, include_tasks, qerr = parse_roster_query(req)
+        if qerr:
+            return qerr
+        assert key is not None
+        if include_tasks and key.tier != "owner":
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        b: Bridge = req.app.state.bridge
+        try:
+            body, etag = b.roster.snapshot(key, agent_filter=agent_filter, status_filter=status_filter,
+                                           include_tasks=include_tasks)
+        except sqlite3.Error:
+            return JSONResponse({"error": "degraded"}, status_code=503)
+        return roster_response(req, body, etag)
+
+    @app.get("/roster/stream")
+    async def roster_stream(req: Request):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        assert key is not None
+        b: Bridge = req.app.state.bridge
+        label = key.label
+        if not b.roster.acquire_stream(label):
+            return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                                headers={"Retry-After": "30"})
+        q = b.bus.subscribe(ROSTER_BUS_KEY)
+
+        async def gen():
+            try:
+                yield b"retry: 3000\n\n"
+                try:
+                    snap, _ = b.roster.snapshot(key)
+                except sqlite3.Error:
+                    yield b'event: error\ndata: {"error":"degraded"}\n\n'
+                    return
+                seq = b.roster.seq
+                yield (f"event: snapshot\nid: {seq}\n"
+                       f"data: {json.dumps(snap, separators=(',', ':'))}\n\n").encode()
+                last = {a["id"]: json.dumps(a, sort_keys=True, separators=(",", ":"))
+                        for a in snap["agents"]}
+                visible = set(b.roster.visible_names(key))
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(q.get(), s.sse_heartbeat_s)
+                    except asyncio.TimeoutError:
+                        if getattr(q, "dropped", False):
+                            return
+                        yield b": keepalive\n\n"
+                        continue
+                    agent_id = ev.get("agent")
+                    if not agent_id or agent_id not in visible:
+                        continue
+                    rec = b.roster.last(agent_id)
+                    if rec is None:
+                        continue
+                    projected = b.roster.project(rec, key)
+                    fp = json.dumps(projected, sort_keys=True, separators=(",", ":"))
+                    if last.get(agent_id) == fp:
+                        continue
+                    last[agent_id] = fp
+                    sid = ev.get("seq", b.roster.seq)
+                    payload = {"seq": sid, "agent": projected}
+                    yield (f"event: update\nid: {sid}\n"
+                           f"data: {json.dumps(payload, separators=(',', ':'))}\n\n").encode()
+            finally:
+                b.bus.unsubscribe(ROSTER_BUS_KEY, q)
+                b.roster.release_stream(label)
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                          "Connection": "keep-alive"})
+
+    @app.get("/roster/{agent}")
+    async def roster_one(req: Request, agent: str):
+        key, err = roster_auth(req)
+        if err:
+            return err
+        assert key is not None
+        _af, status_filter, include_tasks, qerr = parse_roster_query(req)
+        if qerr:
+            return qerr
+        if include_tasks and key.tier != "owner":
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        b: Bridge = req.app.state.bridge
+        if agent not in s.agents or agent not in b.roster.visible_names(key):
+            return JSONResponse({"error": "agent not found"}, status_code=404)
+        try:
+            body, etag = b.roster.snapshot(key, agent_filter=[agent], status_filter=status_filter,
+                                           include_tasks=include_tasks)
+        except sqlite3.Error:
+            return JSONResponse({"error": "degraded"}, status_code=503)
+        return roster_response(req, body, etag)
 
     # ------------------------------------------------------------------ JSON-RPC
     @app.post("/")

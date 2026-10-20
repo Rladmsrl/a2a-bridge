@@ -1,0 +1,496 @@
+"""Live agent roster: infer status from existing task/delivery data (never probe bots),
+project a privacy-tiered view per API key, and publish changes for SSE subscribers."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+from . import models as M
+from .config import ApiKey, Settings
+from .db import Store
+from .events import EventBus
+
+log = logging.getLogger("a2a_bridge.roster")
+
+ROSTER_BUS_KEY = "__roster__"
+VALID_STATUSES = ("offline", "stuck", "busy", "input-required", "idle")
+TTL_SECONDS = 5
+SUBMITTED_STUCK_S = 300
+CONFIDENCE_HIGH_S = 600
+CONFIDENCE_MEDIUM_S = 86400
+
+_URL_RE = re.compile(r"https?://[^\s]+|www\.[^\s]+", re.I)
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+_HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_REPO_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]+/[A-Za-z0-9._-]+\b")
+_MIME_LEFT = {"text", "application", "image", "audio", "video", "multipart", "font", "model"}
+
+
+def ts_to_iso(ts: float | None) -> str | None:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def iso_to_ts(s: str | None) -> float | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def floor_minute_iso(iso: str) -> str:
+    ts = iso_to_ts(iso)
+    if ts is None:
+        return iso
+    return ts_to_iso((int(ts) // 60) * 60) or iso
+
+
+def etag_of(obj: Any) -> str:
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return f'"{hashlib.sha256(raw).hexdigest()[:16]}"'
+
+
+def compile_redact(patterns: list[str]) -> list[re.Pattern]:
+    out: list[re.Pattern] = []
+    for p in patterns:
+        try:
+            out.append(re.compile(p, re.I))
+        except re.error:
+            out.append(re.compile(re.escape(p), re.I))
+    return out
+
+
+def redact_text(text: str, extra: list[re.Pattern]) -> str:
+    if not text:
+        return text
+    s = _URL_RE.sub("[redacted]", text)
+    s = _EMAIL_RE.sub("[redacted]", s)
+    s = _UUID_RE.sub("[redacted]", s)
+    s = _HEX_RE.sub("[redacted]", s)
+
+    def _repo(m: re.Match) -> str:
+        left = m.group(0).split("/", 1)[0]
+        if left.lower() in _MIME_LEFT:
+            return m.group(0)
+        return "[redacted]"
+
+    s = _REPO_RE.sub(_repo, s)
+    for p in extra:
+        s = p.sub("[redacted]", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120].rstrip() if len(s) > 120 else s
+
+
+def _status_text(row: dict) -> str | None:
+    try:
+        st = json.loads(row.get("status_json") or "{}")
+    except json.JSONDecodeError:
+        return None
+    msg = st.get("message")
+    if isinstance(msg, dict) and msg.get("parts"):
+        t = M.text_of(msg["parts"])
+        return t or None
+    return None
+
+
+def _status_ts(row: dict) -> float:
+    try:
+        st = json.loads(row.get("status_json") or "{}")
+        t = iso_to_ts(st.get("timestamp"))
+        if t is not None:
+            return t
+    except json.JSONDecodeError:
+        pass
+    return float(row["updated_at"])
+
+
+def _skills(agent) -> list[dict]:
+    out = []
+    for sk in agent.skills or []:
+        out.append({"id": sk.get("id"), "name": sk.get("name"), "tags": list(sk.get("tags") or [])})
+    return out
+
+
+def _skill_name(agent) -> str:
+    if agent.skills:
+        return agent.skills[0].get("name") or agent.display_name
+    return agent.display_name
+
+
+def _fp(rec: dict) -> str:
+    """Change fingerprint: ignore sub-minute duration (clients have statusSince)."""
+    payload = {k: rec[k] for k in rec if k not in ("statusDurationS",)}
+    payload["durMin"] = rec.get("statusDurationS", 0) // 60
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+class Roster:
+    def __init__(self, settings: Settings, store: Store, bus: EventBus):
+        self.s = settings
+        self.store = store
+        self.bus = bus
+        self.seq = 0
+        self._last: dict[str, dict] = {}
+        self._dirty: set[str] = set()
+        self._last_touch = 0.0
+        self._streams: dict[str, int] = {}
+        self._stream_lock = threading.Lock()
+        self._redact = compile_redact(settings.roster_redact)
+
+    # ------------------------------------------------------------------ liveness evidence (never probes)
+    def note_seen(self, agent: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.store.presence_update(agent, last_seen_at=now)
+        self.touch(agent)
+
+    def note_delivery_ok(self, agent: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.store.presence_update(agent, last_seen_at=now, last_delivery_ok_at=now,
+                                   consecutive_failures=0, delivery_dead=0, throttled_until=None)
+        self.touch(agent)
+
+    def note_delivery_err(self, agent: str, err: str, *, dead: bool, rate_limited: bool,
+                          retry_in_s: float = 0.0, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        fields: dict[str, Any] = {"last_delivery_err_at": now, "last_delivery_err": (err or "")[:200]}
+        if dead:
+            fields["delivery_dead"] = 1
+        if rate_limited:
+            fields["throttled_until"] = now + max(float(retry_in_s), 1.0)
+        self.store.presence_update(agent, increment_failures=True, **fields)
+        self.touch(agent)
+
+    def touch(self, agent: str) -> None:
+        if agent:
+            self._dirty.add(agent)
+            self._last_touch = time.monotonic()
+
+    def tick(self) -> None:
+        self.recompute()
+
+    def last(self, name: str) -> dict | None:
+        return self._last.get(name)
+
+    # ------------------------------------------------------------------ streaming caps
+    def acquire_stream(self, label: str) -> bool:
+        cap = max(1, self.s.roster_max_streams_per_key)
+        with self._stream_lock:
+            n = self._streams.get(label, 0)
+            if n >= cap:
+                return False
+            self._streams[label] = n + 1
+            return True
+
+    def release_stream(self, label: str) -> None:
+        with self._stream_lock:
+            n = self._streams.get(label, 0) - 1
+            if n <= 0:
+                self._streams.pop(label, None)
+            else:
+                self._streams[label] = n
+
+    async def loop(self) -> None:
+        while True:
+            try:
+                delay = 0.05 if self.s.roster_debounce_s <= 0.05 else min(0.2, self.s.roster_debounce_s)
+                await asyncio.sleep(delay)
+                if not self._dirty:
+                    continue
+                if time.monotonic() - self._last_touch < self.s.roster_debounce_s:
+                    continue
+                names = self._dirty.copy()
+                self._dirty.clear()
+                self.recompute(names)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("roster loop error")
+
+    # ------------------------------------------------------------------ scope
+    def visible_names(self, key: ApiKey) -> list[str]:
+        names = list(self.s.agents)
+        if key.tier == "owner":
+            return names
+        names = [n for n in names if self.s.agents[n].roster_visible]
+        if key.agents is not None:
+            names = [n for n in names if n in key.agents]
+        return names
+
+    # ------------------------------------------------------------------ infer + persist
+    def recompute(self, names: Iterable[str] | None = None, now: float | None = None) -> dict[str, dict]:
+        now = time.time() if now is None else now
+        sig = self.store.roster_signals(now - 3600)
+        targets = list(self.s.agents) if names is None else [n for n in names if n in self.s.agents]
+        out: dict[str, dict] = dict(self._last)
+        for name in targets:
+            rec = self._infer(name, now, sig)
+            prev = self._last.get(name)
+            changed = prev is None or _fp(prev) != _fp(rec)
+            if prev is None or prev.get("status") != rec["status"] or prev.get("since") != rec["since"]:
+                self.store.presence_update(name, status=rec["status"], since=rec["since"])
+            if rec["status"] in ("stuck", "offline") and (prev or {}).get("status") != rec["status"]:
+                log.warning("roster %s", rec["status"], extra={"agent": name})
+            out[name] = rec
+            self._last[name] = rec
+            if changed:
+                self.seq += 1
+                self.bus.publish(ROSTER_BUS_KEY, {"seq": self.seq, "agent": name})
+        return {n: out[n] for n in targets if n in out} if names is not None else out
+
+    def snapshot(self, key: ApiKey, *, agent_filter: list[str] | None = None,
+                 status_filter: set[str] | None = None, include_tasks: bool = False,
+                 now: float | None = None) -> tuple[dict, str]:
+        now = time.time() if now is None else now
+        recs = self.recompute(now=now)
+        names = self.visible_names(key)
+        if agent_filter:
+            want = set(agent_filter)
+            names = [n for n in names if n in want]
+        agents = []
+        for n in names:
+            rec = recs.get(n)
+            if rec is None:
+                continue
+            if status_filter and rec["status"] not in status_filter:
+                continue
+            agents.append(self.project(rec, key, include_tasks=include_tasks))
+        body = {
+            "generatedAt": ts_to_iso(now),
+            "viewTier": key.tier,
+            "ttlSeconds": TTL_SECONDS,
+            "stream": f"{self.s.public_base_url}/roster/stream",
+            "agents": agents,
+        }
+        # generatedAt is request-time; ETag reflects the agent view so If-None-Match can 304
+        return body, etag_of({k: v for k, v in body.items() if k != "generatedAt"})
+
+    def _infer(self, name: str, now: float, sig: dict) -> dict:
+        agent = self.s.agents[name]
+        tasks = [t for t in sig["active"] if t["agent"] == name]
+        presence = sig["presence"].get(name) or {}
+        stuck_after = agent.stuck_after_s or self.s.roster_stuck_after_s
+        max_c = agent.max_concurrent
+        by: dict[str, list] = {"submitted": [], "working": [], "input-required": [], "auth-required": []}
+        for t in tasks:
+            by.setdefault(t["state"], []).append(t)
+        working = by["working"]
+        submitted = by["submitted"]
+        interrupted = by["input-required"] + by["auth-required"]
+        working_owner = [t for t in working if t.get("waiting_on") == "owner"]
+        working_real = [t for t in working if t.get("waiting_on") != "owner"]
+        oldest_sub = min((t["updated_at"] for t in submitted), default=None)
+        last_seen = presence.get("last_seen_at")
+        last_err = presence.get("last_delivery_err_at")
+        throttled_until = presence.get("throttled_until")
+        throttled = bool(throttled_until and throttled_until > now)
+        consec = int(presence.get("consecutive_failures") or 0)
+        dead = bool(presence.get("delivery_dead"))
+
+        status = "idle"
+        if dead and (last_seen is None or last_err is None or last_seen <= last_err):
+            status = "offline"
+        elif consec >= 3 and oldest_sub is not None and (now - oldest_sub) >= self.s.roster_offline_after_s:
+            status = "offline"
+        else:
+            stale = [t for t in working_real if now - t["updated_at"] > stuck_after]
+            delivered_stuck = [t for t in submitted
+                               if t["id"] in sig["delivered_submitted"]
+                               and now - t["updated_at"] > SUBMITTED_STUCK_S]
+            if stale or delivered_stuck:
+                status = "stuck"
+            elif working_real:
+                status = "busy"
+            elif interrupted or working_owner:
+                status = "input-required"
+
+        waiting_on = None
+        if status == "input-required":
+            wos = [t.get("waiting_on") for t in tasks if t.get("waiting_on") in ("requester", "owner", "auth")]
+            if "owner" in wos or working_owner:
+                waiting_on = "owner"
+            elif "auth" in wos or by["auth-required"]:
+                waiting_on = "auth"
+            else:
+                waiting_on = "requester"
+
+        active_n = len(working)
+        queued = len(submitted) + max(0, active_n - max_c)
+        capacity = {"maxConcurrent": max_c, "active": active_n, "queued": queued, "throttled": throttled}
+        if status in ("offline", "stuck") or throttled or active_n >= max_c:
+            availability = "unavailable"
+        elif status == "busy" or queued > 0:
+            availability = "limited"
+        else:
+            availability = "available"
+
+        if last_seen is None:
+            confidence = "low"
+        elif now - last_seen <= CONFIDENCE_HIGH_S:
+            confidence = "high"
+        elif now - last_seen <= CONFIDENCE_MEDIUM_S:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        primary = self._primary(status, tasks, stuck_after, now, sig["delivered_submitted"])
+        public = (primary.get("public_activity") if primary else None) or None
+        raw = _status_text(primary) if primary else None
+        skill = _skill_name(agent)
+        activity = self._activity(status, waiting_on, public)
+        if not activity and status in ("busy", "stuck"):
+            activity = f"Working on a {skill} task"
+        elif not activity and status == "input-required":
+            activity = {"owner": "Waiting for owner approval", "auth": "Waiting for authentication"
+                        }.get(waiting_on or "", "Waiting for requester input")
+
+        own_activity: dict[str, str] = {}
+        for t in sorted(tasks, key=lambda x: x["updated_at"]):
+            txt = _status_text(t)
+            if txt:
+                own_activity[t["owner"]] = txt
+
+        prev = self._last.get(name)
+        since = self._since(status, prev, presence, now, tasks, sig["last_terminal"].get(name))
+        counts = {k: len(by[k]) for k in ("submitted", "working", "input-required", "auth-required")}
+        task_rows = []
+        for t in tasks:
+            is_stuck = (t["state"] == "working" and t.get("waiting_on") != "owner"
+                        and now - t["updated_at"] > stuck_after)
+            task_rows.append({"taskId": t["id"], "owner": t["owner"], "state": t["state"],
+                              "updatedAt": ts_to_iso(t["updated_at"]), "stuck": is_stuck})
+        delivery = {
+            "lastOkAt": ts_to_iso(presence.get("last_delivery_ok_at")),
+            "lastErrorAt": ts_to_iso(presence.get("last_delivery_err_at")),
+            "lastError": presence.get("last_delivery_err"),
+            "consecutiveFailures": consec,
+            "outboxPending": int(sig["outbox_pending"].get(name, 0)),
+        }
+        return {
+            "id": name,
+            "name": agent.display_name,
+            "url": f"{self.s.public_base_url}/agents/{name}",
+            "agentCard": f"{self.s.public_base_url}/agents/{name}/.well-known/agent-card.json",
+            "skills": _skills(agent),
+            "status": status,
+            "since": since,
+            "statusDurationS": max(0, int(now - since)),
+            "availability": availability,
+            "capacity": capacity,
+            "activity": activity,
+            "rawActivity": raw,
+            "waitingOn": waiting_on,
+            "lastSeen": last_seen,
+            "confidence": confidence,
+            "own_activity": own_activity,
+            "detail": {
+                "counts": counts,
+                "failedLastHour": int(sig["failed_hour"].get(name, 0)),
+                "delivery": delivery,
+                "rawActivity": raw,
+                "tasks": task_rows,
+            },
+        }
+
+    def _primary(self, status: str, tasks: list[dict], stuck_after: int, now: float,
+                 delivered_sub: set) -> dict | None:
+        if status == "stuck":
+            stale = [t for t in tasks if t["state"] == "working" and t.get("waiting_on") != "owner"
+                     and now - t["updated_at"] > stuck_after]
+            delivered = [t for t in tasks if t["state"] == "submitted" and t["id"] in delivered_sub
+                         and now - t["updated_at"] > SUBMITTED_STUCK_S]
+            pool = stale or delivered
+            return min(pool, key=lambda t: t["updated_at"], default=None)
+        if status == "busy":
+            real = [t for t in tasks if t["state"] == "working" and t.get("waiting_on") != "owner"]
+            return max(real, key=lambda t: t["updated_at"], default=None)
+        if status == "input-required":
+            cand = [t for t in tasks if t["state"] in ("input-required", "auth-required")
+                    or (t["state"] == "working" and t.get("waiting_on") == "owner")]
+            return max(cand, key=lambda t: t["updated_at"], default=None)
+        return None
+
+    def _since(self, status: str, prev: dict | None, presence: dict, now: float,
+               tasks: list[dict], last_terminal: float | None) -> float:
+        if prev and prev.get("status") == status:
+            return float(prev["since"])
+        if prev and prev.get("status") != status:
+            return now
+        if presence.get("status") == status and presence.get("since") is not None:
+            return float(presence["since"])
+        if status in ("busy", "stuck"):
+            working = [t for t in tasks if t["state"] == "working"]
+            if working:
+                return min(_status_ts(t) for t in working)
+        if status == "input-required":
+            cand = [t for t in tasks if t["state"] in ("input-required", "auth-required")
+                    or t.get("waiting_on") == "owner"]
+            if cand:
+                return min(_status_ts(t) for t in cand)
+        if status == "offline":
+            return float(presence["last_delivery_err_at"]) if presence.get("last_delivery_err_at") else now
+        if status == "idle":
+            return float(last_terminal) if last_terminal else now
+        return now
+
+    def _activity(self, status: str, waiting_on: str | None, public: str | None) -> str | None:
+        if public:
+            return redact_text(public, self._redact)
+        if status not in ("busy", "stuck", "input-required"):
+            return None
+        if waiting_on == "owner":
+            return "Waiting for owner approval"
+        if waiting_on == "auth":
+            return "Waiting for authentication"
+        if status == "input-required":
+            return "Waiting for requester input"
+        return None  # caller fills skill template
+
+    def project(self, rec: dict, key: ApiKey, include_tasks: bool = False) -> dict:
+        tier = key.tier
+        out: dict[str, Any] = {
+            "id": rec["id"], "name": rec["name"], "url": rec["url"],
+            "agentCard": rec["agentCard"], "skills": rec["skills"],
+            "availability": rec["availability"],
+        }
+        if tier == "anonymous":
+            return out
+        dur = int(rec["statusDurationS"])
+        if tier == "basic":
+            out["statusDurationS"] = (dur // 60) * 60
+            out["capacity"] = {"queued": rec["capacity"]["queued"] > 0}
+            return out
+        out["status"] = rec["status"]
+        out["statusSince"] = ts_to_iso(rec["since"])
+        out["statusDurationS"] = dur
+        out["capacity"] = dict(rec["capacity"])
+        out["waitingOn"] = rec["waitingOn"]
+        own = (rec.get("own_activity") or {}).get(key.label)
+        out["activity"] = own if own else rec["activity"]
+        last = ts_to_iso(rec["lastSeen"])
+        if last and tier == "trusted":
+            last = floor_minute_iso(last)
+        out["lastSeen"] = last
+        out["confidence"] = rec["confidence"]
+        if tier == "owner":
+            detail = {
+                "counts": rec["detail"]["counts"],
+                "failedLastHour": rec["detail"]["failedLastHour"],
+                "delivery": rec["detail"]["delivery"],
+                "rawActivity": rec["detail"]["rawActivity"],
+            }
+            if include_tasks:
+                detail["tasks"] = rec["detail"]["tasks"]
+            out["detail"] = detail
+        return out
