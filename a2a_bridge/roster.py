@@ -52,21 +52,26 @@ _IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?![
 _INTERNAL_HOST_RE = re.compile(
     r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:local|internal|lan|corp|home|intranet)\b",
     re.I)
-# Ordinary DNS names. Two well-known non-host tokens are put back by _redact_host.
+# Ordinary DNS names. A two-letter TLD counts only with two or more dots
+# (a.b.c.example.cn), so a single token like README.md is left alone.
+# Product names that share a public suffix are put back by _redact_host.
 _PUBLIC_HOST_RE = re.compile(
-    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:com|net|org|edu|gov|io|ai|app|dev|cloud|co)\b",
+    r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:com|net|org|edu|gov|io|ai|app|dev|cloud|co)\b"
+    r"|\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}[A-Za-z]{2}\b",
     re.I)
-_HOST_SKIP = {"asp.net", "socket.io"}
+_HOST_SKIP = {"asp.net", "socket.io", "next.app"}
 _GITHUB_TOKEN_RE = re.compile(
     r"\b(?:gh[pours]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 _AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-# NANP, +86, and 11-digit mobiles (138…). Dates (2026-10-20) and counts (120 200 300) stay.
+# NANP, +86, contiguous 11-digit mobiles, and 3-4-4 grouping (138 0013 8000).
+# Dates, "120 200 300", and spaced counts such as "13 000 000 000" stay.
 _PHONE_RE = re.compile(
     r"(?<!\w)(?:"
     r"\+86[\s.-]?1[3-9](?:[\s.-]?\d){9}"
     r"|(?:\+\d{1,3}[\s.-])?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}"
-    r"|1[3-9](?:[\s.-]?\d){9}"
+    r"|1[3-9]\d{9}"
+    r"|1[3-9]\d[\s.-]\d{4}[\s.-]\d{4}"
     r")(?!\w)")
 # Host and email patterns backtrack on long input. Cap before they run; output is 120.
 _REDACT_INPUT_MAX = 512

@@ -240,6 +240,10 @@ def test_redact_phone_domain_path_and_public_ipv6():
     red_v6 = redact_text(f"addr {public_v6}", [])
     assert "3fff" not in red_v6.lower()
     assert "[redacted]" in red_v6
+    cctld = "a.b.c.example.cn"
+    assert cctld not in redact_text(f"host {cctld} end", [])
+    assert redact_text("Next.app", []) == "Next.app"
+    assert redact_text("13 000 000 000", []) == "13 000 000 000"
 
 
 # --------------------------------------------------------------------------- HTTP: auth, scope, tiers
@@ -1189,6 +1193,27 @@ def test_backfill_status_text_marks_rows_and_skips_terminal_json(tmp_path):
     assert third.get_task("w")["status_text"] == "visible line\nsecond"
     assert third.get_task("d")["status_text"] == ""
     third.close()
+
+
+def test_backfill_skips_non_object_parts(tmp_path):
+    """A parts array that mixes in strings must not abort startup."""
+    s, store, _roster = make_roster(tmp_path)
+    status = {"state": "working", "message": {"parts": [
+        "plain string",
+        {"kind": "text", "text": "kept"},
+        12,
+        None,
+        {"kind": "text", "text": "also"},
+    ]}}
+    store._x(
+        "INSERT INTO tasks(id,context_id,agent,owner,state,status_json,artifacts_json,"
+        "status_text,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("mix", "c", "coder", "main", "working", json.dumps(status), "[]", None, 1, 1))
+    path = s.db_path
+    store.close()
+    again = Store(path)
+    assert again.get_task("mix")["status_text"] == "kept\nalso"
+    again.close()
 
 
 def test_concurrent_store_open_retries_database_locked(tmp_path):

@@ -250,13 +250,17 @@ class Store:
         self._db.execute(
             "UPDATE tasks SET status_text='' WHERE status_text IS NULL AND NOT ("
             "json_valid(status_json)=1 AND json_type(status_json, '$.message.parts')='array')")
+        # Read each part through its fullkey. json_extract on j.value throws
+        # "malformed JSON" when the parts array mixes in strings or numbers.
         self._db.execute(
             "UPDATE tasks SET status_text=COALESCE(("
-            "SELECT substr(group_concat(json_extract(j.value, '$.text'), char(10)), 1, 500) "
-            "FROM json_each(json_extract(tasks.status_json, '$.message.parts')) AS j "
-            "WHERE json_extract(j.value, '$.kind')='text' "
-            "AND json_type(j.value, '$.text')='text' "
-            "AND json_extract(j.value, '$.text')!=''"
+            "SELECT substr(group_concat("
+            "json_extract(tasks.status_json, j.fullkey || '.text'), char(10)), 1, 500) "
+            "FROM json_each(tasks.status_json, '$.message.parts') AS j "
+            "WHERE j.type='object' "
+            "AND json_extract(tasks.status_json, j.fullkey || '.kind')='text' "
+            "AND json_type(tasks.status_json, j.fullkey || '.text')='text' "
+            "AND json_extract(tasks.status_json, j.fullkey || '.text')!=''"
             "), '') WHERE status_text IS NULL")
 
     def _backfill_presence(self) -> None:

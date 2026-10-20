@@ -246,7 +246,7 @@ CREATE INDEX IF NOT EXISTS ix_outbox_task_kind_status ON outbox(task_id, kind, s
 2. trusted 看到的 activity 来源优先级：
    a. bot 在回调里提供的 `metadata.roster.publicActivity`（BOT-SIDE.md 约定：不含项目/仓库/人名/URL，≤120 字符），存入 `tasks.public_activity`；
    b. 否则用模板：`"Working on a <skill name> task"` / `"Waiting for requester input"` / `"Waiting for owner approval"`（skill 名来自 agents.json，可公开）。
-3. 即使是 (a) 也过一遍清洗：入口先把字符串截到 512 字符（主机名/邮箱正则在超长输入上会回溯），再去掉 URL、邮箱、`org/repo`（`text/plain` 这类 MIME 保留；`unit/integration` 这类通用片段只有左右两边都是通用词才保留，所以 `src/secret-billing` 会去掉）、长 hex/uuid、私网/回环/链路本地 IPv4、全部 IPv6（含公网地址，以及 `::1`、`fe80::1`）、内网主机名（`.local`/`.internal`/`.corp` 等）和普通域名（如 `billing.example.com`）。**不**把 `ASP.NET`、`socket.io` 当主机名。GitHub/AWS token、JWT、电话（含 `+86` 和以 138 开头的 11 位手机号；不误伤 `2026-10-20` 或 `120 200 300`）同样去掉。命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，输出截断 120 字符。
+3. 即使是 (a) 也过一遍清洗：入口先把字符串截到 512 字符（主机名/邮箱正则在超长输入上会回溯），再去掉 URL、邮箱、`org/repo`（`text/plain` 这类 MIME 保留；`unit/integration` 这类通用片段只有左右两边都是通用词才保留，所以 `src/secret-billing` 会去掉）、长 hex/uuid、私网/回环/链路本地 IPv4、全部 IPv6（含公网地址，以及 `::1`、`fe80::1`）、内网主机名（`.local`/`.internal`/`.corp` 等）和普通域名（如 `billing.example.com`，以及带国家后缀、至少两个点的 `a.b.c.example.cn`）。**不**把 `ASP.NET`、`socket.io`、`Next.app` 当主机名。GitHub/AWS token、JWT、电话（含 `+86` 和以 138 开头的 11 位手机号；不误伤 `2026-10-20`、`120 200 300` 或 `13 000 000 000`）同样去掉。命中 `A2A_ROSTER_REDACT` 的词替换成 `[redacted]`，输出截断 120 字符。
 4. 请求方是自己的 key 时（`tasks.owner == key.label`），该 key 可以看到**自己任务**的原始状态消息——这和它通过 `tasks/get` 已经能拿到的信息一致，不额外泄露。
 
 ## 7. Agent Card 扩展与 A2A 兼容性
